@@ -1,5 +1,4 @@
 # leaf_gate_clipseg.py
-# Zero-shot Leaf ROI via CLIPSeg (prompted segmentation) — robust prompts + padding/truncation
 
 import torch
 import numpy as np
@@ -13,10 +12,6 @@ MODEL_NAME = "CIDAS/clipseg-rd64-refined"
 
 
 def _sanitize_prompts(prompts: Optional[Iterable]) -> List[str]:
-    """
-    ทำ prompts ให้เป็นลิสต์สตริงแบบแบน (flat), ตัดช่องว่าง, ตัดค่าว่าง, ตัดซ้ำ
-    รองรับกรณีผู้ใช้ป้อน tuple/list ซ้อน (list of lists)
-    """
     default = [
         "a close-up photo of a single leaf",
         "green leaf with visible veins",
@@ -43,7 +38,6 @@ def _sanitize_prompts(prompts: Optional[Iterable]) -> List[str]:
     else:
         _push(prompts)
 
-    # unique แบบคงลำดับ
     seen = set()
     flat = []
     for s in out:
@@ -58,61 +52,42 @@ def _sanitize_prompts(prompts: Optional[Iterable]) -> List[str]:
 
 
 class LeafGateCLIPSeg:
-    """
-    Zero-shot prompted segmentation เพื่อหา mask ของ 'leaf'
-    คืนภาพครอป (PIL) รอบบริเวณใบที่ใหญ่สุด ถ้าไม่เจอ mask ที่มั่นใจจะ fallback เป็นภาพเต็ม
-    """
     def __init__(self, prompts: Optional[Iterable] = None, thresh: float = 0.5):
         self.processor = CLIPSegProcessor.from_pretrained(MODEL_NAME)
         self.model = CLIPSegForImageSegmentation.from_pretrained(MODEL_NAME).to(DEVICE).eval()
         self.prompts = _sanitize_prompts(prompts)
         self.thresh = float(thresh)
 
-    # ในไฟล์ leaf_gate_clipseg.py
-    # แทนที่ทั้งเมธอด _predict_mask_logits ด้วยเวอร์ชันนี้
-
     @torch.no_grad()
     def _predict_mask_logits(self, image_pil: Image.Image) -> np.ndarray:
-        # 1) ทำ prompts ให้เป็นลิสต์สตริงแบบแบนและสะอาด
         texts = _sanitize_prompts(self.prompts)
-
-        # 2) ทำสำเนาภาพซ้ำให้ "ยาวเท่ากับจำนวน prompt"
         images = [image_pil] * len(texts)
 
-        # 3) เรียก processor โดยเปิด padding / truncation (สำคัญ)
         inputs = self.processor(
             text=texts,
-            images=images,  # << สำคัญ: ใช้ list ของภาพให้เท่ากับจำนวน texts
+            images=images,
             return_tensors="pt",
             padding=True,
             truncation=True,
         ).to(DEVICE)
 
-        out = self.model(**inputs)  # logits shape ขึ้นกับโหมด batching
-        logits = out.logits  # คาดว่าเป็น [N, 1, Hm, Wm] เมื่อ N = len(texts)
+        out = self.model(**inputs)
+        logits = out.logits  # expected [N, 1, H, W] or [1, N, H, W]
 
-        # 4) ทำให้เป็นรูป [N_prompts, Hm, Wm] เสมอ แล้วรวมด้วย logsumexp
         if logits.ndim == 4:
-            # หลาย ๆ กรณีจะได้ [N, 1, H, W] → บีบแกนช่องให้กลายเป็น [N, H, W]
             if logits.shape[1] == 1:
-                maps = logits.squeeze(1)  # [N, H, W]
+                maps = logits.squeeze(1)      # [N, H, W]
+            elif logits.shape[0] == 1:
+                maps = logits[0]              # [N, H, W]
             else:
-                # บางเวอร์ชัน (โหมดเดิม) อาจเป็น [1, N, H, W] → ดึงแกน batch ออกแทน
-                # กรณีนี้เลือกแกนที่มีขนาดมากกว่า 1 เป็น N
-                if logits.shape[0] == 1:
-                    maps = logits[0]  # [N, H, W]
-                else:
-                    # fallback ปลอดภัย: สมมติแกน 0 คือ N
-                    maps = logits[:, 0, :, :]
+                maps = logits[:, 0, :, :]
         elif logits.ndim == 3:
-            maps = logits  # [N, H, W]
+            maps = logits
         else:
             raise ValueError(f"Unexpected logits shape: {tuple(logits.shape)}")
 
-        # รวมหลาย prompt ให้เป็น heatmap เดียวแบบคม ๆ
         maps = maps.to(torch.float32)
         logits_lse = torch.logsumexp(maps, dim=0)  # [H, W]
-
         return logits_lse.detach().cpu().numpy()
 
     def _resize_to(self, arr: np.ndarray, shape_hw: Tuple[int, int]) -> np.ndarray:
@@ -120,7 +95,6 @@ class LeafGateCLIPSeg:
         return cv2.resize(arr, (W, H), interpolation=cv2.INTER_CUBIC)
 
     def _postprocess_mask(self, prob_map: np.ndarray) -> np.ndarray:
-        # prob_map ∈ [0,1] → binary mask → morphology ให้เนียนขึ้น
         mask = (prob_map > self.thresh).astype(np.uint8) * 255
         if mask.sum() == 0:
             return mask
@@ -139,7 +113,6 @@ class LeafGateCLIPSeg:
         if cv2.contourArea(cnt) < min_area_ratio * (H * W):
             return None
         x, y, bw, bh = cv2.boundingRect(cnt)
-        # padding เล็กน้อย
         px, py = int(0.03 * W), int(0.03 * H)
         x = max(0, x - px)
         y = max(0, y - py)
@@ -152,7 +125,7 @@ class LeafGateCLIPSeg:
         H, W = np_img.shape[:2]
 
         logits = self._predict_mask_logits(image_pil)
-        prob = 1.0 / (1.0 + np.exp(-logits))  # sigmoid
+        prob = 1.0 / (1.0 + np.exp(-logits))
         prob = self._resize_to(prob, (H, W))
         bin_mask = self._postprocess_mask(prob)
 
