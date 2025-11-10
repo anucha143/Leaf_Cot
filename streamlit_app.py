@@ -47,7 +47,10 @@ st.title("🌿 Leaf Gate (CLIPSeg) + ViT Classifier Demo")
 
 with st.sidebar:
     st.header("Settings")
-    ckpt_path = st.text_input("Path to checkpoint (.pt)", value="./checkpoints_vit_lora/best_vit_lora_vit_small_patch14_dinov2.pt")
+    ckpt_path = st.text_input(
+        "Path to checkpoint (.pt)",
+        value="./checkpoints_vit_lora/best_vit_lora_vit_small_patch14_dinov2.pt",
+    )
     default_prompts = (
         "a close-up photo of a single leaf",
         "green leaf with visible veins",
