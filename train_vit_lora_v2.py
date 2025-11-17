@@ -1,5 +1,5 @@
 # train_vit_lora_v2.py
-# ViT + LoRA + Class Weights (GPU/CPU friendly)
+# ViT + LoRA + Class Weights (GPU/CPU friendly, AMP-compatible for old/new PyTorch)
 
 import os
 import math
@@ -8,15 +8,20 @@ import time
 import random
 
 import numpy as np
+from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 import timm
 from torchvision import datasets, transforms
+from torchvision.transforms import InterpolationMode
 from sklearn.metrics import f1_score, confusion_matrix, classification_report
+
+# ---- cuDNN tune เมื่อมี CUDA ----
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
 
 
 # ------------------------- Utils -------------------------
@@ -31,6 +36,70 @@ def set_seed(seed: int = 42):
 def smart_collate(batch):
     imgs, labels = zip(*batch)
     return torch.stack(imgs), torch.tensor(labels)
+
+
+# ===== AMP helpers (รองรับทั้ง PyTorch เก่า/ใหม่) =====
+# - บางเวอร์ชันรองรับ device_type บางเวอร์ชันไม่รองรับ
+# - ใช้ try/except เพื่อตรวจสอบความสามารถจริงแทนการเช็กเวอร์ชันสตริง
+try:
+    # ลอง import แบบใหม่ก่อน
+    from torch.amp import autocast as _autocast_new, GradScaler as _GradScaler_new
+    _HAVE_TORCH_AMP = True
+except Exception:
+    _HAVE_TORCH_AMP = False
+    from torch.cuda.amp import autocast as _autocast_old, GradScaler as _GradScaler_old  # type: ignore
+
+
+def make_grad_scaler(enabled: bool):
+    """คืน GradScaler ที่ใช้ได้กับ PyTorch ทุกเวอร์ชัน"""
+    if _HAVE_TORCH_AMP:
+        try:
+            return _GradScaler_new(device_type="cuda", enabled=enabled)
+        except TypeError:
+            return _GradScaler_new(enabled=enabled)
+    else:
+        return _GradScaler_old(enabled=enabled)
+
+
+class _AutoCastCtx:
+    """context manager เล็ก ๆ ที่ลองใช้ device_type ถ้าใช้ไม่ได้จะ fallback อัตโนมัติ"""
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.ctx = None
+
+    def __enter__(self):
+        if _HAVE_TORCH_AMP:
+            try:
+                self.ctx = _autocast_new(device_type="cuda", enabled=self.enabled)
+            except TypeError:
+                self.ctx = _autocast_new(enabled=self.enabled)
+        else:
+            self.ctx = _autocast_old(enabled=self.enabled)
+        return self.ctx.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self.ctx.__exit__(exc_type, exc_val, exc_tb)
+
+
+# ===== Checkpoint helpers (dict-based) =====
+
+def save_best_ckpt(save_path: str, model, class_names, best_metric, args):
+    to_save = {
+        "model": model.state_dict(),
+        "classes": class_names,
+        "best_metric": float(best_metric),
+        "args": dict(vars(args)),
+    }
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(to_save, save_path)
+
+
+def load_ckpt_to_model(ckpt_path: str, model, device):
+    # PyTorch 2.6: default weights_only=True → เรากำหนด False เพราะเราเซฟเป็น dict
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(state["model"])
+    classes = state.get("classes", None)
+    return classes, state
 
 
 # --------------------- LoRA Components --------------------
@@ -82,7 +151,6 @@ def freeze_all_but_norm_and_head(model: nn.Module):
     # freeze ทั้งหมดก่อน
     for _, p in model.named_parameters():
         p.requires_grad = False
-
     # unfreeze head
     if hasattr(model, "get_classifier"):
         head = model.get_classifier()
@@ -91,7 +159,6 @@ def freeze_all_but_norm_and_head(model: nn.Module):
     elif hasattr(model, "head"):
         for p in model.head.parameters():
             p.requires_grad = True
-
     # unfreeze normalization layers
     for m in model.modules():
         if isinstance(m, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
@@ -149,7 +216,7 @@ def train_one_epoch(model,
                     loader,
                     optimizer,
                     scheduler,
-                    device: str,
+                    device: torch.device,
                     epoch: int,
                     num_classes: int,
                     class_weights: torch.Tensor,
@@ -160,7 +227,8 @@ def train_one_epoch(model,
     - ถ้า mixup_alpha = 0: ใช้ cross-entropy + class weights (ช่วยบาลานซ์คลาส)
     """
     model.train()
-    scaler = GradScaler(enabled=use_amp)
+
+    scaler = make_grad_scaler(enabled=use_amp)
 
     total_loss = 0.0
     total_correct = 0
@@ -176,7 +244,7 @@ def train_one_epoch(model,
             # mixup + soft labels
             images, soft_labels, _ = do_mixup(images, labels, num_classes, alpha=mixup_alpha)
             if use_amp:
-                with autocast():
+                with _AutoCastCtx(enabled=use_amp):
                     logits = model(images)
                     loss = soft_ce_loss(logits, soft_labels)
                 scaler.scale(loss).backward()
@@ -190,7 +258,7 @@ def train_one_epoch(model,
         else:
             # no mixup -> weighted CE
             if use_amp:
-                with autocast():
+                with _AutoCastCtx(enabled=use_amp):
                     logits = model(images)
                     loss = F.cross_entropy(logits, labels, weight=class_weights)
                 scaler.scale(loss).backward()
@@ -216,7 +284,7 @@ def train_one_epoch(model,
 
 
 @torch.no_grad()
-def evaluate(model, loader, device: str, num_classes: int, class_weights: torch.Tensor):
+def evaluate(model, loader, device: torch.device, num_classes: int, class_weights: torch.Tensor):
     model.eval()
     total_loss = 0.0
     total = 0
@@ -260,7 +328,7 @@ def main():
     parser.add_argument('--lora_r', type=int, default=8)
     parser.add_argument('--lora_alpha', type=int, default=16)
     parser.add_argument('--lora_dropout', type=float, default=0.05)
-    parser.add_argument('--mixup', type=float, default=0.0, help='แนะนำให้เริ่มที่ 0 สำหรับ dataset เล็ก')
+    parser.add_argument('--mixup', type=float, default=0.0, help='เริ่มที่ 0 สำหรับ dataset เล็ก')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--no_amp', action='store_true')
     parser.add_argument('--save_dir', type=str, default='./checkpoints_vit_lora')
@@ -268,8 +336,8 @@ def main():
 
     set_seed(args.seed)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"[INFO] Using device: {device}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[INFO] Using device: {device.type}")
     os.makedirs(args.save_dir, exist_ok=True)
 
     # สร้างโมเดล
@@ -287,9 +355,10 @@ def main():
     freeze_all_but_norm_and_head(model)
     model.to(device)
 
-    # Transforms
+    # ---- Transforms (รวมเป็นชุดเดียว และบังคับ RGB) ----
     train_tf = transforms.Compose([
-        transforms.RandomResizedCrop(args.img_size, scale=(0.7, 1.0), ratio=(0.8, 1.25)),
+        transforms.Lambda(lambda img: img.convert("RGB")),
+        transforms.RandomResizedCrop(args.img_size, scale=(0.7, 1.0), ratio=(0.8, 1.25), interpolation=InterpolationMode.BICUBIC),
         transforms.RandAugment(),
         transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
         transforms.RandomHorizontalFlip(),
@@ -297,13 +366,14 @@ def main():
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
     eval_tf = transforms.Compose([
-        transforms.Resize(int(args.img_size * 1.15)),
+        transforms.Lambda(lambda img: img.convert("RGB")),
+        transforms.Resize(int(args.img_size * 1.15), interpolation=InterpolationMode.BICUBIC),
         transforms.CenterCrop(args.img_size),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
 
-    # Dirs
+    # ---- Dirs ----
     train_dir = os.path.join(args.data_dir, 'train')
     val_dir = os.path.join(args.data_dir, 'val')
     test_dir = os.path.join(args.data_dir, 'test')
@@ -318,7 +388,6 @@ def main():
     print("[Classes]", class_names)
 
     # ---- คำนวณ class weights จาก train set ----
-    # class i weight = N_total / (num_classes * N_i)
     targets = np.array(train_set.targets)
     counts = np.bincount(targets, minlength=num_classes).astype(np.float32)
     weights = counts.sum() / (num_classes * (counts + 1e-6))
@@ -326,34 +395,24 @@ def main():
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
     print("[Class Weights]", class_weights.tolist())
 
-    # DataLoaders
+    # ---- DataLoaders ----
+    use_cuda = torch.cuda.is_available()
+    pin_mem = True if use_cuda else False
+
     train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device == 'cuda'),
-        drop_last=True,
-        collate_fn=smart_collate,
+        train_set, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=pin_mem
     )
     val_loader = DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device == 'cuda'),
-        collate_fn=smart_collate,
+        val_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=pin_mem
     )
     test_loader = DataLoader(
-        test_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device == 'cuda'),
-        collate_fn=smart_collate,
+        test_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=pin_mem
     )
 
-    # Optimizer
+    # ---- Optimizer & Scheduler ----
     decay, no_decay = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -377,10 +436,11 @@ def main():
     warmup_steps = steps_per_epoch * args.warmup_epochs
     scheduler = WarmupCosine(optimizer, warmup_steps, total_steps, min_lr=1e-6)
 
-    use_amp = (device == 'cuda') and (not args.no_amp)
+    use_amp = (device.type == 'cuda') and (not args.no_amp)
     print(f"[INFO] AMP enabled: {use_amp}")
 
     best_val_f1 = -1.0
+    best_ckpt = f"best_vit_lora_{args.model}_v2.pt"
 
     # -------- Train loop --------
     for epoch in range(1, args.epochs + 1):
@@ -410,30 +470,18 @@ def main():
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-            save_path = os.path.join(args.save_dir, f"best_vit_lora_{args.model}_v2.pt")
-            torch.save(
-                {
-                    'model_state': model.state_dict(),
-                    'class_names': class_names,
-                    'args': vars(args),
-                    'val_macro_f1': val_f1,
-                    'class_weights': class_weights.detach().cpu().numpy(),
-                },
-                save_path,
-            )
-            print(f"[SAVE] {save_path} (val_macroF1={val_f1:.4f})")
+            save_path = os.path.join(args.save_dir, best_ckpt)
+            save_best_ckpt(save_path, model, class_names, best_val_f1, args)
+            print(f"[SAVE] {save_path} (val_macroF1={best_val_f1:.4f})")
 
     # -------- Test --------
     print("\n[TEST] Evaluating best model on test set ...")
-    ckpts = [f for f in os.listdir(args.save_dir) if f.startswith(f"best_vit_lora_{args.model}_v2")]
-    assert ckpts, "No best checkpoint found for v2."
-    best_ckpt = sorted(ckpts)[-1]
+    ckpt_path = os.path.join(args.save_dir, best_ckpt)
+    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}"
+    classes, state = load_ckpt_to_model(ckpt_path, model, device)
 
-    state = torch.load(os.path.join(args.save_dir, best_ckpt), map_location=device)
-    model.load_state_dict(state['model_state'])
     test_loss, test_acc, test_f1, cm, report = evaluate(
-        model, test_loader, device, num_classes,
-        class_weights=torch.tensor(state['class_weights'], dtype=torch.float32, device=device)
+        model, test_loader, device, num_classes, class_weights  # ใช้ class_weights ปัจจุบัน
     )
 
     print(f"[TEST] loss={test_loss:.4f} acc={test_acc:.4f} macroF1={test_f1:.4f}")
