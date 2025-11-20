@@ -133,7 +133,6 @@ class LoRALinear(nn.Module):
         lora_out = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
         return base_out + lora_out
 
-
 def apply_lora_to_vit(model: nn.Module, r=8, alpha=16, lora_dropout=0.05,
                       target_modules=("qkv", "proj")):
     replaced = 0

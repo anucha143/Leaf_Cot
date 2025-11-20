@@ -1,106 +1,510 @@
-# streamlit_app_leaf_demo.py
-# Streamlit demo: CLIPSeg Leaf Gate + ViT classifier
-
 import os
-import io
-from typing import Tuple
-
-import streamlit as st
-import torch
-from PIL import Image
 import numpy as np
+import streamlit as st
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import timm
+from torchvision import transforms as T
+import joblib
 
 from leaf_gate_clipseg import LeafGateCLIPSeg
-from infer_vit_with_clipseg_gate import load_classifier
 
-st.set_page_config(page_title="Leaf Classifier Demo", page_icon="🌿", layout="wide")
+# =========================================================
+# 1. ConvNeXt-style 1D head  (ใช้เหมือนตอนเทรน)
+# =========================================================
 
-@st.cache_resource(show_spinner=False)
-def load_gate(prompts: Tuple[str, ...], thresh: float):
-    clean = []
-    for p in prompts:
-        if isinstance(p, (list, tuple)):
-            for q in p:
-                s = str(q).strip()
-                if s:
-                    clean.append(s)
+class ConvNeXt1DBlock(nn.Module):
+    def __init__(self, dim: int, kernel_size: int = 7, layer_scale_init_value: float = 1e-6):
+        super().__init__()
+        # depthwise conv 1D
+        self.dwconv = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=dim,
+        )
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pw1 = nn.Linear(dim, 4 * dim)
+        self.act = nn.GELU()
+        self.pw2 = nn.Linear(4 * dim, dim)
+        self.gamma = (
+            nn.Parameter(layer_scale_init_value * torch.ones(dim))
+            if layer_scale_init_value > 0
+            else None
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, L, D]  (เราใช้ L=1)
+        """
+        shortcut = x  # [B, L, D]
+
+        # [B, L, D] -> [B, D, L] เพื่อใช้ conv1d
+        x = x.transpose(1, 2)
+        x = self.dwconv(x)
+        x = x.transpose(1, 2)  # กลับเป็น [B, L, D]
+
+        x = self.norm(x)
+        x = self.pw1(x)
+        x = self.act(x)
+        x = self.pw2(x)
+
+        if self.gamma is not None:
+            x = self.gamma * x
+
+        x = x + shortcut
+        return x
+
+
+class ConvNeXt1DHead(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        num_blocks: int = 2,
+    ):
+        """
+        in_dim      = dim ของ feature จาก ViT (เช่น 384) หรือจาก PCA
+        hidden_dim  = dim ภายใน ConvNeXt block
+        num_classes = จำนวนคลาส (เช่น 3)
+        """
+        super().__init__()
+        # โปรเจกต์จาก feature_dim -> hidden_dim
+        self.proj = nn.Linear(in_dim, hidden_dim)
+
+        # สร้างหลาย ๆ ConvNeXt block
+        self.blocks = nn.Sequential(
+            *[ConvNeXt1DBlock(hidden_dim) for _ in range(num_blocks)]
+        )
+
+        # norm ด้านท้าย
+        self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
+
+        # classifier สุดท้าย
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, F]  (F = feature_dim จาก ViT หรือ PCA)
+        return: [B, num_classes]
+        """
+        # 1) โปรเจกต์ก่อน
+        x = self.proj(x)          # [B, H]
+
+        # 2) ใส่มิติ L=1 เพื่อผ่าน ConvNeXt1DBlock
+        x = x.unsqueeze(1)        # [B, 1, H]
+        x = self.blocks(x)        # [B, 1, H]
+
+        # 3) ดึงออกมาเหลือ [B, H]
+        x = x[:, 0, :]            # [B, H]
+
+        # 4) norm + fc
+        x = self.norm(x)          # [B, H]
+        x = self.fc(x)            # [B, num_classes]
+        return x
+
+
+# =========================================================
+# 2. ViT feature extractor
+# =========================================================
+
+IMG_SIZE_VIT = 518
+VIT_MODEL_NAME = "vit_small_patch14_dinov2"
+MODEL_DIR = "models"  # ที่เก็บ .pkl / .pth / .npy
+
+
+def get_eval_transform(img_size: int = IMG_SIZE_VIT):
+    return T.Compose([
+        T.Resize(int(img_size * 1.15)),
+        T.CenterCrop(img_size),
+        T.ToTensor(),
+        T.Normalize(mean=(0.5, 0.5, 0.5),
+                    std=(0.5, 0.5, 0.5)),
+    ])
+
+
+@st.cache_resource
+def load_vit_backbone(
+    model_name: str = VIT_MODEL_NAME,
+    img_size: int = IMG_SIZE_VIT,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vit = timm.create_model(model_name, pretrained=True, num_classes=0)  # num_classes=0 -> return features
+    vit.eval().to(device)
+    tfm = get_eval_transform(img_size)
+    return vit, tfm, device
+
+
+@torch.no_grad()
+def extract_vit_feature_from_pil(
+    pil_img: Image.Image,
+    vit: nn.Module,
+    tfm,
+    device: torch.device,
+) -> np.ndarray:
+    """
+    รับ PIL.Image 1 รูป -> คืน feature vector np.array (D,)
+    ให้ logic สอดคล้องกับ extract_vit_features.py
+    """
+    img = pil_img.convert("RGB")
+    x = tfm(img).unsqueeze(0).to(device)   # [1, 3, H, W]
+
+    out = vit.forward_features(x)
+
+    if isinstance(out, dict):
+        # timm บางรุ่นคืน dict
+        if "x_norm_clstoken" in out and isinstance(out["x_norm_clstoken"], torch.Tensor):
+            feat = out["x_norm_clstoken"]     # [1, D]
+        elif "cls_token" in out and isinstance(out["cls_token"], torch.Tensor):
+            feat = out["cls_token"]           # [1, D]
         else:
-            s = str(p).strip()
-            if s:
-                clean.append(s)
-    if not clean:
-        clean = ["a close-up photo of a single leaf"]
-    return LeafGateCLIPSeg(prompts=clean, thresh=thresh)
+            tensors_2d = [
+                v for v in out.values()
+                if isinstance(v, torch.Tensor) and v.ndim == 2
+            ]
+            if not tensors_2d:
+                raise RuntimeError("forward_features(dict) ไม่มี tensor ขนาด [B, D]")
+            feat = tensors_2d[0]
+    elif isinstance(out, torch.Tensor):
+        if out.ndim == 4:
+            # [B, C, H, W] -> GAP -> [B, C]
+            feat = out.mean(dim=[2, 3])
+        elif out.ndim == 3:
+            # [B, N, D] -> เอา CLS token
+            feat = out[:, 0, :]
+        elif out.ndim == 2:
+            feat = out
+        else:
+            raise RuntimeError(f"ไม่รู้จัก shape ของ features: {out.shape}")
+    else:
+        raise RuntimeError("forward_features คืน type ที่ไม่รองรับ")
+
+    feat_np = feat[0].detach().cpu().numpy().astype(np.float32)  # (D,)
+    return feat_np
 
 
+# =========================================================
+# 3. โหลด ML models + PCA + ConvNeXt1D
+# =========================================================
 
-@st.cache_resource(show_spinner=False)
-def load_clf(ckpt_path: str):
-    return load_classifier(ckpt_path)
+@st.cache_resource
+def load_ml_models():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def pil_from_upload(uploaded_file) -> Image.Image:
-    byts = uploaded_file.read()
-    return Image.open(io.BytesIO(byts)).convert("RGB")
+    # ----- class names -----
+    raw = np.load(os.path.join(MODEL_DIR, "class_names.npy"), allow_pickle=True)
+    if isinstance(raw, np.ndarray):
+        class_names = [str(x) for x in raw.tolist()]
+    else:
+        class_names = [str(raw)]
 
+    num_classes = len(class_names)
 
-st.title("🌿 Leaf Gate (CLIPSeg) + ViT Classifier Demo")
+    # ----- SVM / RF (no PCA) -----
+    svm = joblib.load(os.path.join(MODEL_DIR, "svm.pkl"))
+    rf = joblib.load(os.path.join(MODEL_DIR, "rf.pkl"))
 
-with st.sidebar:
-    st.header("Settings")
-    ckpt_path = st.text_input(
-        "Path to checkpoint (.pt)",
-        value="./checkpoints_vit_lora/best_vit_lora_vit_small_patch14_dinov2.pt",
+    # ----- ConvNeXt1D (no PCA) -----
+    feat_dim = 384  # ต้องตรงกับ feature dim จาก ViT
+    conv_no_pca = ConvNeXt1DHead(
+        in_dim=feat_dim,
+        hidden_dim=384,
+        num_classes=num_classes,
+        num_blocks=2,
     )
-    default_prompts = (
-        "a close-up photo of a single leaf",
-        "green leaf with visible veins",
-        "a plant leaf on plain background",
-        "macro photo of leaf veins",
+    state_no_pca = torch.load(os.path.join(MODEL_DIR, "convnext1d_no_pca.pth"), map_location=device)
+    conv_no_pca.load_state_dict(state_no_pca)
+    conv_no_pca.to(device).eval()
+
+    # ----- PCA + SVM / RF / ConvNeXt -----
+    pca = joblib.load(os.path.join(MODEL_DIR, "pca.pkl"))
+    svm_pca = joblib.load(os.path.join(MODEL_DIR, "svm_pca.pkl"))
+    rf_pca = joblib.load(os.path.join(MODEL_DIR, "rf_pca.pkl"))
+
+    pca_dim = pca.n_components_
+    conv_pca = ConvNeXt1DHead(
+        in_dim=pca_dim,
+        hidden_dim=pca_dim,
+        num_classes=num_classes,
+        num_blocks=2,
     )
-    prompts_txt = st.text_area("Prompts (one per line)", value="\n".join(default_prompts), height=150)
-    prompt_list = tuple([p.strip() for p in prompts_txt.splitlines() if p.strip()])
-    thresh = st.slider("Mask Threshold", 0.0, 1.0, 0.5, 0.01)
-    run_btn = st.button("Run Prediction", type="primary")
+    state_pca = torch.load(os.path.join(MODEL_DIR, "convnext1d_pca.pth"), map_location=device)
+    conv_pca.load_state_dict(state_pca)
+    conv_pca.to(device).eval()
 
-col1, col2, col3 = st.columns([1, 1, 1])
+    return {
+        "device": device,
+        "class_names": class_names,
+        "svm": svm,
+        "rf": rf,
+        "conv_no_pca": conv_no_pca,
+        "pca": pca,
+        "svm_pca": svm_pca,
+        "rf_pca": rf_pca,
+        "conv_pca": conv_pca,
+    }
 
-uploaded = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
 
-if uploaded and run_btn:
-    if not os.path.exists(ckpt_path):
-        st.error(f"Checkpoint not found: {ckpt_path}")
-        st.stop()
-    with st.spinner("Loading models... (first time may download weights)"):
-        gate = load_gate(prompt_list, thresh)
-        model, class_names, img_size, tfm = load_clf(ckpt_path)
+# =========================================================
+# 4. Ensemble prediction
+# =========================================================
 
-    pil = pil_from_upload(uploaded)
+def softmax_np(logits):
+    logits = np.asarray(logits, dtype=np.float32)
+    logits = logits - logits.max()
+    exps = np.exp(logits)
+    return exps / exps.sum()
 
-    crop, dbg, fb = gate.crop_leaf_from_pil(pil, return_debug=True)
 
-    x = tfm(crop).unsqueeze(0).to("cuda" if torch.cuda.is_available() else "cpu")
+def predict_all_models(feat_vec: np.ndarray, models: dict):
+    """
+    feat_vec: np.array shape (D,) จาก ViT
+    models: dict ที่ได้จาก load_ml_models()
+    """
+    device = models["device"]
+    class_names = models["class_names"]
+
+    svm = models["svm"]
+    rf = models["rf"]
+    conv_no_pca = models["conv_no_pca"]
+
+    pca = models["pca"]
+    svm_pca = models["svm_pca"]
+    rf_pca = models["rf_pca"]
+    conv_pca = models["conv_pca"]
+
+    # --------- เตรียม input ---------
+    x = feat_vec.reshape(1, -1).astype(np.float32)   # (1, D)
+
+    # ===== Non-PCA =====
+    proba_svm = svm.predict_proba(x)[0]
+    proba_rf = rf.predict_proba(x)[0]
+
     with torch.no_grad():
-        logits = model(x)
-        probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
-        pred_idx = int(probs.argmax())
+        x_t = torch.from_numpy(x).to(device)
+        logits_conv = conv_no_pca(x_t)          # [1, C]
+        proba_conv = softmax_np(logits_conv.cpu().numpy()[0])
 
-    with col1:
-        st.subheader("Original")
-        st.image(pil, use_column_width=True)
-    with col2:
-        st.subheader("Mask Overlay")
-        cap = "Fallback (full image)" if fb else "Leaf region detected"
-        st.image(dbg, use_column_width=True, caption=cap)
-    with col3:
-        st.subheader("Leaf Crop → ViT Input")
-        st.image(crop, use_column_width=True)
+    proba_ens_non_pca = (proba_svm + proba_rf + proba_conv) / 3.0
 
-    st.markdown("---")
-    st.subheader("Prediction")
-    st.write(f"**Predicted:** {class_names[pred_idx]}  \n**Confidence:** {probs[pred_idx]:.3f}")
-    st.bar_chart({cls: probs[i] for i, cls in enumerate(class_names)})
-    st.caption("Note: Bars show softmax probabilities over your 3 classes.")
+    # ===== PCA =====
+    x_pca = pca.transform(x).astype(np.float32)
 
-else:
-    st.info("⬅️ Upload an image and press **Run Prediction**.")
-    st.caption("Tip: the first run may take a while to download CLIPSeg weights.")
+    proba_svm_pca = svm_pca.predict_proba(x_pca)[0]
+    proba_rf_pca = rf_pca.predict_proba(x_pca)[0]
+
+    with torch.no_grad():
+        x_pca_t = torch.from_numpy(x_pca).to(device)
+        logits_conv_pca = conv_pca(x_pca_t)
+        proba_conv_pca = softmax_np(logits_conv_pca.cpu().numpy()[0])
+
+    proba_ens_pca = (proba_svm_pca + proba_rf_pca + proba_conv_pca) / 3.0
+
+    def idx2name(idx):
+        return class_names[int(idx)]
+
+    res = {
+        "non_pca": {
+            "svm": {
+                "proba": proba_svm,
+                "pred_idx": int(proba_svm.argmax()),
+            },
+            "rf": {
+                "proba": proba_rf,
+                "pred_idx": int(proba_rf.argmax()),
+            },
+            "convnext": {
+                "proba": proba_conv,
+                "pred_idx": int(proba_conv.argmax()),
+            },
+            "ensemble": {
+                "proba": proba_ens_non_pca,
+                "pred_idx": int(proba_ens_non_pca.argmax()),
+            },
+        },
+        "pca": {
+            "svm_pca": {
+                "proba": proba_svm_pca,
+                "pred_idx": int(proba_svm_pca.argmax()),
+            },
+            "rf_pca": {
+                "proba": proba_rf_pca,
+                "pred_idx": int(proba_rf_pca.argmax()),
+            },
+            "convnext_pca": {
+                "proba": proba_conv_pca,
+                "pred_idx": int(proba_conv_pca.argmax()),
+            },
+            "ensemble_pca": {
+                "proba": proba_ens_pca,
+                "pred_idx": int(proba_ens_pca.argmax()),
+            },
+        },
+    }
+
+    # ใส่ label text เพิ่ม
+    for g in res.values():
+        for k, v in g.items():
+            v["pred_label"] = idx2name(v["pred_idx"])
+
+    return res
+
+
+# =========================================================
+# 5. Leaf Gate (CLIPSeg)
+# =========================================================
+
+@st.cache_resource
+def load_leaf_gate():
+    """
+    LeafGateCLIPSeg ภายในจะจัดการ device เอง
+    """
+    gate = LeafGateCLIPSeg()
+    return gate
+
+
+# =========================================================
+# 6. Streamlit UI
+# =========================================================
+def main():
+    st.title("Leaf Classification Demo 🌿")
+    st.write("ViT → ML (SVM, RF, ConvNeXt1D) + PCA + Ensemble")
+
+    # โหลดโมเดลหลักต่าง ๆ (มี cache แล้ว)
+    gate = load_leaf_gate()                         # CLIPSeg LeafGate
+    vit, vit_tfm, vit_device = load_vit_backbone()  # ViT feature extractor
+    models = load_ml_models()                       # SVM, RF, ConvNeXt, PCA, ฯลฯ
+
+    # ===== 1) อัปโหลดรูปภาพ =====
+    uploaded_file = st.file_uploader(
+        "อัปโหลดรูปใบไม้ (jpg, png)",
+        type=["jpg", "jpeg", "png"],
+        key="uploader"
+    )
+
+    if uploaded_file is None:
+        st.info("กรุณาอัปโหลดรูปภาพก่อน")
+        # ถ้าเปลี่ยนไฟล์ใหม่ ให้ล้างผลเก่าออก (กันสับสน)
+        st.session_state.pop("feat", None)
+        st.session_state.pop("results", None)
+        return
+
+    pil = Image.open(uploaded_file).convert("RGB")
+    st.image(pil, caption="ภาพต้นฉบับ", use_container_width=True)
+
+    # ===== 2) เลือกว่าจะใช้ Leaf Gate (CLIPSeg) หรือไม่ =====
+    use_gate = st.checkbox("ใช้ Leaf Gate (CLIPSeg) ตัดเฉพาะส่วนใบไม้", value=True)
+
+    leaf_img = pil       # รูปที่จะส่งเข้า ViT (เริ่มต้น = รูปเต็ม)
+    debug_imgs = None    # สำหรับเก็บรูป debug (overlay / mask ฯลฯ)
+
+    if use_gate:
+        with st.spinner("กำลังตรวจหาบริเวณใบไม้ด้วย CLIPSeg..."):
+            crop, dbg, fb = gate.crop_leaf_from_pil(pil, return_debug=True)
+
+        if crop is None:
+            st.warning("ไม่พบใบไม้ชัดเจนในภาพนี้ (mask มีน้อยกว่า threshold)")
+            return
+
+        leaf_img = crop
+        debug_imgs = dbg
+
+        st.subheader("ผล Leaf Gate (CLIPSeg)")
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.image(leaf_img, caption="Crop เฉพาะใบไม้", use_container_width=True)
+
+        with c2:
+            # ป้องกัน error: dbg อาจเป็น dict หรือเป็นรูปเดี่ยว
+            if debug_imgs is not None:
+                if isinstance(debug_imgs, dict):
+                    if "overlay" in debug_imgs:
+                        st.image(
+                            debug_imgs["overlay"],
+                            caption="Overlay mask",
+                            use_container_width=True
+                        )
+                    elif "mask" in debug_imgs:
+                        st.image(
+                            debug_imgs["mask"],
+                            caption="Mask",
+                            use_container_width=True
+                        )
+                elif isinstance(debug_imgs, Image.Image):
+                    st.image(
+                        debug_imgs,
+                        caption="Overlay / Mask",
+                        use_container_width=True
+                    )
+
+    st.subheader("ขั้นตอนถัดไป: สร้าง Feature ด้วย ViT และทำนายด้วย ML")
+
+    # ===== 3) เลือกโมเดลหลักที่จะโชว์ผล (เลือกได้ตั้งแต่ก่อน predict) =====
+    model_choice = st.selectbox(
+        "เลือกโมเดลสำหรับผลหลัก",
+        [
+            "SVM",
+            "Random Forest",
+            "ConvNeXt",
+            "Ensemble (non-PCA)",
+            "SVM + PCA",
+            "Random Forest + PCA",
+            "ConvNeXt + PCA",
+            "Ensemble with PCA",
+        ],
+        key="model_choice"
+    )
+
+    choice_to_key = {
+        "SVM": ("non_pca", "svm"),
+        "Random Forest": ("non_pca", "rf"),
+        "ConvNeXt": ("non_pca", "convnext"),
+        "Ensemble (non-PCA)": ("non_pca", "ensemble"),
+        "SVM + PCA": ("pca", "svm_pca"),
+        "Random Forest + PCA": ("pca", "rf_pca"),
+        "ConvNeXt + PCA": ("pca", "convnext_pca"),
+        "Ensemble with PCA": ("pca", "ensemble_pca"),
+    }
+
+    # ===== 4) ปุ่ม Predict -> คำนวณและเก็บลง session_state =====
+    if st.button("🔍 Predict ด้วย ML Models"):
+        with st.spinner("กำลังดึง Feature จาก ViT..."):
+            feat = extract_vit_feature_from_pil(leaf_img, vit, vit_tfm, vit_device)
+
+        with st.spinner("กำลังทำนายด้วย SVM / RF / ConvNeXt / PCA / Ensemble..."):
+            results = predict_all_models(feat, models)
+
+        st.session_state["feat"] = feat
+        st.session_state["results"] = results
+
+    # ===== 5) ถ้ามีผลลัพธ์แล้ว (ใน session_state) ให้แสดงตาม model_choice =====
+    if "results" in st.session_state:
+        feat = st.session_state["feat"]
+        results = st.session_state["results"]
+
+        st.success(f"ได้ feature vector ขนาด {feat.shape[0]} มิติ จาก ViT")
+
+        group_key, inner_key = choice_to_key[model_choice]
+        main_res = results[group_key][inner_key]
+
+        probs_main = main_res["proba"]
+        label_main = main_res["pred_label"]
+
+        st.markdown(f"### ✅ ผลจากโมเดล: **{model_choice}**")
+        st.write(f"**Predicted class**: `{label_main}`")
+        st.write("**Probabilities:**")
+        for cls_name, p in zip(models["class_names"], probs_main):
+            st.write(f"- {cls_name}: {p:.3f}")
+    else:
+        st.info("กดปุ่ม **Predict ด้วย ML Models** ก่อน เพื่อดูผลการทำนาย")
+
+
+if __name__ == "__main__":
+    main()
