@@ -386,6 +386,7 @@ def main():
     )
 
     if uploaded_file is None:
+        st.info("กรุณาอัปโหลดรูปภาพใบไม้ เพื่อเริ่มการจำแนก")
         return
 
     # อ่านรูปเป็น PIL.Image
@@ -407,7 +408,6 @@ def main():
         return
 
     # แสดงเฉพาะรูปหลังผ่าน Leaf Gate ตามที่ต้องการ
-    st.subheader("ภาพใบไม้หลังผ่าน Leaf Gate")
     st.image(leaf_img, caption="Leaf Gate Output", use_column_width=True)
 
     # ----------------------------
