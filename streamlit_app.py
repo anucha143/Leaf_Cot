@@ -206,11 +206,7 @@ def load_ml_models():
 
     num_classes = len(class_names)
 
-    # ----- SVM / RF (no PCA) -----
-    svm = joblib.load(os.path.join(MODEL_DIR, "svm.pkl"))
-    rf = joblib.load(os.path.join(MODEL_DIR, "rf.pkl"))
-
-    # ----- ConvNeXt1D (no PCA) -----
+    # ----- โหลดเฉพาะ ConvNeXt ที่เราจะใช้จริง -----
     feat_dim = 384  # ต้องตรงกับ feature dim จาก ViT
     conv_no_pca = ConvNeXt1DHead(
         in_dim=feat_dim,
@@ -222,140 +218,15 @@ def load_ml_models():
     conv_no_pca.load_state_dict(state_no_pca)
     conv_no_pca.to(device).eval()
 
-    # ----- PCA + SVM / RF / ConvNeXt -----
-    pca = joblib.load(os.path.join(MODEL_DIR, "pca.pkl"))
-    svm_pca = joblib.load(os.path.join(MODEL_DIR, "svm_pca.pkl"))
-    rf_pca = joblib.load(os.path.join(MODEL_DIR, "rf_pca.pkl"))
-
-    pca_dim = pca.n_components_
-    conv_pca = ConvNeXt1DHead(
-        in_dim=pca_dim,
-        hidden_dim=pca_dim,
-        num_classes=num_classes,
-        num_blocks=2,
-    )
-    state_pca = torch.load(os.path.join(MODEL_DIR, "convnext1d_pca.pth"), map_location=device)
-    conv_pca.load_state_dict(state_pca)
-    conv_pca.to(device).eval()
-
     return {
         "device": device,
         "class_names": class_names,
-        "svm": svm,
-        "rf": rf,
         "conv_no_pca": conv_no_pca,
-        "pca": pca,
-        "svm_pca": svm_pca,
-        "rf_pca": rf_pca,
-        "conv_pca": conv_pca,
     }
 
-# =========================================================
-# 4. Ensemble prediction
-# =========================================================
-
-def softmax_np(logits):
-    logits = np.asarray(logits, dtype=np.float32)
-    logits = logits - logits.max()
-    exps = np.exp(logits)
-    return exps / exps.sum()
-
-def predict_all_models(feat_vec: np.ndarray, models: dict):
-    """
-    feat_vec: np.array shape (D,) จาก ViT
-    models: dict ที่ได้จาก load_ml_models()
-    """
-    device = models["device"]
-    class_names = models["class_names"]
-
-    svm = models["svm"]
-    rf = models["rf"]
-    conv_no_pca = models["conv_no_pca"]
-
-    pca = models["pca"]
-    svm_pca = models["svm_pca"]
-    rf_pca = models["rf_pca"]
-    conv_pca = models["conv_pca"]
-
-    # --------- เตรียม input ---------
-    x = feat_vec.reshape(1, -1).astype(np.float32)   # (1, D)
-
-    # ===== Non-PCA =====
-    proba_svm = svm.predict_proba(x)[0]
-    proba_rf = rf.predict_proba(x)[0]
-
-    with torch.no_grad():
-        x_t = torch.from_numpy(x).to(device)
-        logits_conv = conv_no_pca(x_t)          # [1, C]
-        proba_conv = softmax_np(logits_conv.cpu().numpy()[0])
-
-    proba_ens_non_pca = (proba_svm + proba_rf + proba_conv) / 3.0
-
-    # ===== PCA =====
-    x_pca = pca.transform(x).astype(np.float32)
-
-    proba_svm_pca = svm_pca.predict_proba(x_pca)[0]
-    proba_rf_pca = rf_pca.predict_proba(x_pca)[0]
-
-    with torch.no_grad():
-        x_pca_t = torch.from_numpy(x_pca).to(device)
-        logits_conv_pca = conv_pca(x_pca_t)
-        proba_conv_pca = softmax_np(logits_conv_pca.cpu().numpy()[0])
-
-    proba_ens_pca = (proba_svm_pca + proba_rf_pca + proba_conv_pca) / 3.0
-
-    def idx2name(idx):
-        return class_names[int(idx)]
-
-    res = {
-        "non_pca": {
-            "svm": {
-                "proba": proba_svm,
-                "pred_idx": int(proba_svm.argmax()),
-            },
-            "rf": {
-                "proba": proba_rf,
-                "pred_idx": int(proba_rf.argmax()),
-            },
-            "convnext": {
-                "proba": proba_conv,
-                "pred_idx": int(proba_conv.argmax()),
-            },
-            "ensemble": {
-                "proba": proba_ens_non_pca,
-                "pred_idx": int(proba_ens_non_pca.argmax()),
-            },
-        },
-        "pca": {
-            "svm_pca": {
-                "proba": proba_svm_pca,
-                "pred_idx": int(proba_svm_pca.argmax()),
-            },
-            "rf_pca": {
-                "proba": proba_rf_pca,
-                "pred_idx": int(proba_rf_pca.argmax()),
-            },
-            "convnext_pca": {
-                "proba": proba_conv_pca,
-                "pred_idx": int(proba_conv_pca.argmax()),
-            },
-            "ensemble_pca": {
-                "proba": proba_ens_pca,
-                "pred_idx": int(proba_ens_pca.argmax()),
-            },
-        },
-    }
-
-    # ใส่ label text เพิ่ม
-    for g in res.values():
-        for k, v in g.items():
-            v["pred_label"] = idx2name(v["pred_idx"])
-
-    return res
-
 
 # =========================================================
-# 5. Leaf Gate (CLIPSeg)
+# 4. Leaf Gate (CLIPSeg)
 # =========================================================
 
 @st.cache_resource
@@ -368,17 +239,32 @@ def load_leaf_gate():
 
 
 # =========================================================
-# 6. Streamlit UI
+# 5. Streamlit UI
 # =========================================================
 def main():
-    # ปรับสีหัวข้อให้เป็นสีเขียวพาสเทล #CCFFCC
+    # ปรับ "สีตัวอักษร" ของหัวข้อให้เป็นสีเขียวพาสเทล (ไม่ใช้กล่อง / ไม่ใช้ padding)
+    st.markdown(
+        """
+        <style>
+        h1 {
+            color: #66CC99;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    st.title("Leaf Classification Web Service 🌿")
+    st.title("Leaf Classification Demo 🌿")
+    st.write(
+        "ระบบนี้จะใช้ **Leaf Gate (CLIPSeg)** ในการตัดเฉพาะบริเวณใบไม้ "
+        "จากนั้นใช้ **ViT (DINOv2)** สร้าง feature และใช้ **ConvNeXt1D** "
+        "เป็นตัวจำแนกใบไม้ 3 กลุ่ม: dicot / monocot / other"
+    )
 
     # โหลดโมเดลหลักทั้งหมด (cache เพื่อลดเวลาโหลดซ้ำ)
-    gate = load_leaf_gate()                      # Leaf Gate (CLIPSeg)
+    gate = load_leaf_gate()                         # Leaf Gate (CLIPSeg)
     vit, vit_tfm, vit_device = load_vit_backbone()  # ViT feature extractor
-    models = load_ml_models()                    # รวม ConvNeXt และข้อมูลอื่น ๆ
+    models = load_ml_models()                       # ConvNeXt และ class names
 
     # อัปโหลดรูปจากผู้ใช้
     uploaded_file = st.file_uploader(
@@ -394,23 +280,34 @@ def main():
     pil = Image.open(uploaded_file).convert("RGB")
 
     # ----------------------------
-    # 1) Leaf Gate ทำงานอัตโนมัติ (ไม่มี checkbox แล้ว)
+    # 1) Leaf Gate ทำงานอัตโนมัติ
+    #    และ "ทำงานเฉพาะกรณีที่มี mask สีเขียวจริง ๆ"
     # ----------------------------
     with st.spinner("กำลังตรวจหาบริเวณใบไม้ด้วย Leaf Gate..."):
         try:
-            # คืนเฉพาะภาพใบไม้ที่ถูกครอปแล้ว (ขนาดใกล้เคียง 518x518)
-            leaf_img = gate.crop_leaf_from_pil(pil)
+            # ใช้ return_debug=True เพื่อเช็คว่า Leaf Gate ต้อง fallback หรือไม่
+            leaf_img, dbg_img, used_fallback = gate.crop_leaf_from_pil(
+                pil,
+                out_size=IMG_SIZE_VIT,
+                return_debug=True,
+            )
         except Exception as e:
             st.error(f"เกิดข้อผิดพลาดในขั้นตอน Leaf Gate: {e}")
             return
 
-    if leaf_img is None:
-        st.warning("ไม่พบใบไม้ชัดเจนในภาพนี้ กรุณาลองอัปโหลดรูปอื่น")
+    # ถ้า used_fallback = True หมายถึง Leaf Gate หา mask ไม่เจอ
+    # (ไม่มีพื้นที่สีเขียวเพียงพอ) -> ไม่ทำงานต่อ / ไม่จำแนก
+    if used_fallback:
+        st.warning(
+            "Leaf Gate ไม่พบพื้นที่ใบไม้ที่ชัดเจนในภาพนี้ "
+            "หรือไม่มีบริเวณที่เป็นสีเขียวเพียงพอในการสร้าง mask\n\n"
+            "กรุณาลองอัปโหลดรูปที่มีใบไม้ชัดเจน หรือมีการระบายสีเขียวเฉพาะบริเวณใบอีกครั้ง 🙂"
+        )
         return
 
-    # แสดงเฉพาะรูปหลังผ่าน Leaf Gate ตามที่ต้องการ
-    st.subheader("ภาพใบไม้หลังผ่าน Leaf Gate")
-    st.image(leaf_img, caption="Leaf Gate Output", use_column_width=True)
+    # ตาม requirement ใหม่: ไม่ต้องแสดงภาพ 518×518 ที่ถูก Crop แล้ว
+    # ดังนั้นเราจะข้าม st.image(leaf_img) ไปเลย
+    # ถ้าในอนาคตอยาก debug สามารถนำ st.image(..) กลับมาได้ง่าย ๆ
 
     # ----------------------------
     # 2) ปุ่ม Predict ด้วย ConvNeXt เพียงอย่างเดียว
@@ -423,7 +320,7 @@ def main():
             )  # shape = (D,)
 
             device = models["device"]
-            conv_model = models["conv_no_pca"]      # ใช้ ConvNeXt (non-PCA) ตัวที่แม่นยำสุด
+            conv_model = models["conv_no_pca"]      # ใช้ ConvNeXt (non-PCA)
             class_names = models["class_names"]
 
             x = feat.reshape(1, -1).astype(np.float32)  # (1, D)
@@ -447,4 +344,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
