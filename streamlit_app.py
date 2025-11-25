@@ -386,7 +386,6 @@ def main():
     )
 
     if uploaded_file is None:
-        st.info("กรุณาอัปโหลดรูปภาพใบไม้ เพื่อเริ่มการจำแนก")
         return
 
     # อ่านรูปเป็น PIL.Image
