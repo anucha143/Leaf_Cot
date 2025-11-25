@@ -40,6 +40,11 @@ st.markdown(
 # -------------------------------------------------
 
 
+# -------------------------------------------------
+# 1. ConvNeXt 1D block + head (ต้องเหมือนตอนเทรนใน train_ml_with_convnext_pca_ensemble.py)
+# -------------------------------------------------
+
+
 class ConvNeXt1DBlock(nn.Module):
     """
     1D ConvNeXt block:
@@ -59,7 +64,6 @@ class ConvNeXt1DBlock(nn.Module):
         super().__init__()
         up_dim = in_channels * mlp_ratio
 
-        # depthwise conv: ทำงานบนแกนเวลา/ลำดับ (L) โดยไม่เปลี่ยนจำนวน channel
         self.dwconv = nn.Conv1d(
             in_channels=in_channels,
             out_channels=in_channels,
@@ -67,57 +71,47 @@ class ConvNeXt1DBlock(nn.Module):
             padding=kernel_size // 2,
             groups=in_channels,
         )
-
-        # layer norm บน dim channel
         self.norm = nn.LayerNorm(in_channels, eps=1e-6)
-
-        # pointwise MLP: C -> 4C -> C (เหมือน ConvNeXt ปกติ)
         self.pw1 = nn.Linear(in_channels, up_dim)
         self.act = nn.GELU()
         self.pw2 = nn.Linear(up_dim, in_channels)
-
-        # gamma เป็น learnable scale สำหรับ output ของ block
         self.gamma = nn.Parameter(scale_init_value * torch.ones(in_channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, C, L]
-        """
+        # x: [B, C, L]
         shortcut = x
 
-        # Conv1d ทำงานกับ [B, C, L]
-        # แต่ LayerNorm / Linear ของเราตั้งค่าให้ normalize ที่ dim สุดท้าย
-        # จึงต้อง transpose ไป-กลับ
-        x = x
-        x = self.dwconv(x)         # [B, C, L]
-        x = x.transpose(1, 2)      # [B, L, C]
+        x = self.dwconv(x)      # [B, C, L]
+        x = x.transpose(1, 2)   # [B, L, C]
         x = self.norm(x)
         x = self.pw1(x)
         x = self.act(x)
         x = self.pw2(x)
         x = x * self.gamma
-        x = x.transpose(1, 2)      # [B, C, L]
+        x = x.transpose(1, 2)   # [B, C, L]
 
-        x = x + shortcut
-        return x
+        return x + shortcut
 
 
 class ConvNeXt1DHead(nn.Module):
     """
-    หัว ConvNeXt 1D แบบง่ายสำหรับเอา ViT feature vector มา classify 3 class
-    ใช้ได้ทั้งกรณี input เป็น feature ตรง ๆ หรือ feature ที่ลดมิติด้วย PCA แล้ว
+    หัว ConvNeXt 1D แบบเดียวกับที่ใช้ตอนเทรน:
+    - รับ feature [B, D]
+    - แปลงเป็น [B, D, 1] -> ผ่าน ConvNeXt blocks
+    - Global pooling -> Linear(proj) -> GELU -> Linear(fc) -> logits [B, num_classes]
     """
 
     def __init__(
         self,
-        in_dim: int = 384,     # ขนาด feature จาก ViT
-        num_classes: int = 3,  # dicot / monocot / other
+        in_dim: int = 384,       # ขนาด feature จาก ViT
+        hidden_dim: int = 384,   # hidden dimension ในชั้น proj
+        num_classes: int = 3,    # dicot / monocot / other
         num_blocks: int = 2,
         mlp_ratio: int = 4,
     ) -> None:
         super().__init__()
 
-        # แปลง [B, D] -> [B, D, 1] แล้วรันผ่าน ConvNeXt block หลายชั้น
+        # ConvNeXt blocks ทำงานบน [B, D, 1]
         blocks = []
         for _ in range(num_blocks):
             blocks.append(
@@ -130,26 +124,22 @@ class ConvNeXt1DHead(nn.Module):
             )
         self.blocks = nn.Sequential(*blocks)
 
-        # normalize feature ก่อนเข้า fc
-        self.norm = nn.LayerNorm(in_dim, eps=1e-6)
-
-        # classifier สุดท้าย
-        self.fc = nn.Linear(in_dim, num_classes)
+        # ตรงนี้สำคัญ: ต้องมี "proj" เพราะ checkpoint มีคีย์ proj.weight / proj.bias
+        self.proj = nn.Linear(in_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, D]
-        """
-        # เพิ่มแกน L=1 เพื่อใช้กับ Conv1d
-        x = x.unsqueeze(-1)           # [B, D, 1]
-        x = self.blocks(x)            # [B, D, 1]
+        # x: [B, D]
+        x = x.unsqueeze(-1)        # [B, D, 1]
+        x = self.blocks(x)         # [B, D, 1]
+        x = x.mean(dim=-1)         # [B, D] (global pooling)
 
-        # global pooling ตามแกน L (ซึ่งมีขนาด 1 อยู่แล้ว)
-        x = x.mean(dim=-1)            # [B, D]
-
-        x = self.norm(x)
-        x = self.fc(x)                # [B, num_classes]
+        x = self.proj(x)           # [B, hidden_dim]
+        x = self.act(x)
+        x = self.fc(x)             # [B, num_classes]
         return x
+
 
 
 # -------------------------------------------------
