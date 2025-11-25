@@ -371,15 +371,34 @@ def load_leaf_gate():
 # 6. Streamlit UI
 # =========================================================
 def main():
+    # ================================
+    # 1) หัวข้อสีเขียวพาสเทล (ไม่มี padding / box)
+    # ================================
+    st.markdown(
+        """
+        <h1 style="color:#CCFFCC; font-weight:700; margin:0 0 0.5rem 0;">
+            Leaf Classification Demo 🌿
+        </h1>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    st.title("Leaf Classification Web Service 🌿")
+    st.write(
+        "ระบบนี้จะใช้ **Leaf Gate (CLIPSeg)** ในการตัดเฉพาะบริเวณใบไม้ "
+        "จากนั้นใช้ **ViT (DINOv2)** สร้าง feature และใช้ **ConvNeXt1D** "
+        "เป็นตัวจำแนกใบไม้ 3 กลุ่ม: dicot / monocot / other"
+    )
 
-    # โหลดโมเดลหลักทั้งหมด (cache เพื่อลดเวลาโหลดซ้ำ)
-    gate = load_leaf_gate()                      # Leaf Gate (CLIPSeg)
+    # ================================
+    # 2) โหลดโมเดลหลักทั้งหมด
+    # ================================
+    gate = load_leaf_gate()                         # Leaf Gate (CLIPSeg)
     vit, vit_tfm, vit_device = load_vit_backbone()  # ViT feature extractor
-    models = load_ml_models()                    # รวม ConvNeXt และข้อมูลอื่น ๆ
+    models = load_ml_models()                       # ConvNeXt + class names
 
-    # อัปโหลดรูปจากผู้ใช้
+    # ================================
+    # 3) อัปโหลดรูปจากผู้ใช้
+    # ================================
     uploaded_file = st.file_uploader(
         "อัปโหลดรูปใบไม้ (jpg, png)",
         type=["jpg", "jpeg", "png"],
@@ -389,39 +408,53 @@ def main():
         st.info("กรุณาอัปโหลดรูปภาพใบไม้ เพื่อเริ่มการจำแนก")
         return
 
-    # อ่านรูปเป็น PIL.Image
+    # อ่านรูปเป็น PIL.Image (ภาพต้นฉบับ)
     pil = Image.open(uploaded_file).convert("RGB")
 
-    # ----------------------------
-    # 1) Leaf Gate ทำงานอัตโนมัติ (ไม่มี checkbox แล้ว)
-    # ----------------------------
-    with st.spinner("กำลังตรวจหาบริเวณใบไม้ ..."):
+    # แสดง "ภาพต้นฉบับ" ให้ผู้ใช้เห็นเสมอ (เพื่อความเป็นมิตรต่อผู้ใช้)
+    st.subheader("ภาพที่อัปโหลด")
+    st.image(pil, caption="ภาพต้นฉบับที่อัปโหลด", use_column_width=True)
+
+    # ================================
+    # 4) Leaf Gate ทำงานอัตโนมัติ
+    #    และอนุญาตให้ทำงานเฉพาะเมื่อเจอใบไม้จริง ๆ เท่านั้น
+    # ================================
+    with st.spinner("กำลังตรวจหาบริเวณใบไม้ด้วย Leaf Gate..."):
         try:
-            # คืนเฉพาะภาพใบไม้ที่ถูกครอปแล้ว (ขนาดใกล้เคียง 518x518)
-            leaf_img = gate.crop_leaf_from_pil(pil)
+            # ใช้ return_debug=True เพื่อให้ได้ flag used_fallback
+            leaf_img, dbg_img, used_fallback = gate.crop_leaf_from_pil(
+                pil,
+                out_size=IMG_SIZE_VIT,
+                return_debug=True,
+            )
         except Exception as e:
             st.error(f"เกิดข้อผิดพลาดในขั้นตอน Leaf Gate: {e}")
             return
 
-    if leaf_img is None:
-        st.warning("ไม่พบใบไม้ชัดเจนในภาพนี้ กรุณาลองอัปโหลดรูปอื่น")
+    # ถ้า used_fallback = True แปลว่า CLIPSeg หาใบไม้ไม่เจอ (ไม่มี mask สีเขียว)
+    # กรณีนี้เราจะ "ไม่จำแนก" และให้ผู้ใช้ลองรูปใหม่
+    if used_fallback:
+        st.warning(
+            "Leaf Gate ไม่พบพื้นที่ใบไม้หรือสีเขียวเพียงพอในภาพนี้ \n\n"
+            "กรุณาลองอัปโหลดรูปที่มีใบไม้ชัดเจน หรือมีการระบายสีเขียวเฉพาะบริเวณใบอีกครั้ง 🙂"
+        )
         return
 
-    # แสดงเฉพาะรูปหลังผ่าน Leaf Gate ตามที่ต้องการ
-    st.image(leaf_img, caption="Leaf Gate Output", use_column_width=True)
+    # หมายเหตุ: เราใช้ leaf_img (ภาพที่ครอปเป็น 518×518) เฉพาะสำหรับโมเดลเท่านั้น
+    #           แต่ *ไม่แสดง* รูปนี้บนหน้าจอ ตามความต้องการของคุณ
 
-    # ----------------------------
-    # 2) ปุ่ม Predict ด้วย ConvNeXt เพียงอย่างเดียว
-    # ----------------------------
+    # ================================
+    # 5) ปุ่ม Predict ด้วย ConvNeXt เพียงอย่างเดียว
+    # ================================
     if st.button("🔍 Predict ด้วย ConvNeXt"):
-        # 2.1 ดึง feature จาก ViT ใช้ภาพที่ผ่าน Leaf Gate แล้วเท่านั้น
         with st.spinner("กำลังดึงคุณลักษณะจาก ViT และทำนายผลด้วย ConvNeXt..."):
+            # ดึง feature จาก ViT โดยใช้ภาพ leaf_img ที่ผ่าน Leaf Gate แล้ว
             feat = extract_vit_feature_from_pil(
                 leaf_img, vit, vit_tfm, vit_device
             )  # shape = (D,)
 
             device = models["device"]
-            conv_model = models["conv_no_pca"]      # ใช้ ConvNeXt (non-PCA) ตัวที่แม่นยำสุด
+            conv_model = models["conv_no_pca"]      # ใช้ ConvNeXt (non-PCA)
             class_names = models["class_names"]
 
             x = feat.reshape(1, -1).astype(np.float32)  # (1, D)
@@ -431,7 +464,9 @@ def main():
                 logits = conv_model(x_t)               # [1, num_classes]
                 probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
-        # 2.2 แสดงผลลัพธ์จาก ConvNeXt
+        # ================================
+        # 6) แสดงผลลัพธ์จาก ConvNeXt
+        # ================================
         pred_idx = int(probs.argmax())
         pred_label = class_names[pred_idx]
 
