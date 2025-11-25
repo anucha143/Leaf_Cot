@@ -1,8 +1,17 @@
 streamlit
+
 torch
 torchvision
 timm
-transformers
-opencv-python
+
+numpy
 pillow
+
+scikit-learn
+joblib
+
+opencv-python-headless
+transformers
+huggingface-hub
+tqdm
 
