@@ -121,20 +121,16 @@ class LeafGateCLIPSeg:
         return x, y, bw, bh
 
     def crop_leaf_from_pil(self, image_pil: Image.Image, out_size: int = 518, return_debug: bool = False):
-        # แปลงเป็น numpy image (H, W, 3)
         np_img = np.array(image_pil.convert("RGB"))
         H, W = np_img.shape[:2]
 
-        # 1) สร้าง mask ด้วย CLIPSeg
         logits = self._predict_mask_logits(image_pil)
         prob = 1.0 / (1.0 + np.exp(-logits))
         prob = self._resize_to(prob, (H, W))
-        bin_mask = self._postprocess_mask(prob)  # uint8 0/255
+        bin_mask = self._postprocess_mask(prob)
 
-        # 2) หา bounding box ของใบไม้
         bbox = self._tight_bbox(bin_mask)
         if bbox is None:
-            # หาใบไม้ไม่เจอ -> ใช้ภาพเต็ม และ mark ว่า fallback
             crop_rgb = np_img
             used_fallback = True
         else:
@@ -142,32 +138,26 @@ class LeafGateCLIPSeg:
             crop_rgb = np_img[y:y + bh, x:x + bw]
             used_fallback = False
 
-        # 3) ภาพที่ส่งเข้า ViT (resize แล้ว) – ใช้เฉพาะกับโมเดล
-        crop_pil = Image.fromarray(crop_rgb).resize(
-            (out_size, out_size),
-            Image.BICUBIC
-        )
+        crop_pil = Image.fromarray(crop_rgb).resize((out_size, out_size), Image.BICUBIC)
 
-        # 4) ภาพ debug สำหรับโชว์บนเว็บ
         if return_debug:
-            # ✅ ใช้ "ภาพต้นฉบับ" เป็นพื้นหลังเลย
             overlay = np_img.copy()
 
-            # ✅ ระบายสีเขียวทึบเฉพาะจุดที่เป็นใบไม้
-            #    ถ้าอยากเห็น texture ใบไม้ใต้ mask ให้ใช้ blend ด้านล่างแทน
-            # overlay[bin_mask == 255] = np.array([0, 255, 0], dtype=np.uint8)
-
+            # 🔽 ปรับความจางของสีเขียวตรงนี้
+            alpha = 0.15  # ยิ่งตัวเลขน้อย สีเขียวจะยิ่งจาง (ลองปรับ 0.1–0.2 ได้)
             mask_idx = (bin_mask == 255)
-            green = np.array([0, 255, 0], dtype=np.uint8)
-            alpha = 0.4  # 0.0 = ไม่เขียว, 1.0 = เขียวทึบ
-            overlay[mask_idx] = (
-                overlay[mask_idx] * (1 - alpha) + green * alpha
-            ).astype(np.uint8)
-            # ---------------------------------------------------------------------
+            green = np.array([0, 255, 0], dtype=np.float32)
+
+            overlay_f = overlay.astype(np.float32)
+            overlay_f[mask_idx] = (
+                    overlay_f[mask_idx] * (1.0 - alpha) + green * alpha
+            )
+            overlay = overlay_f.astype(np.uint8)
 
             dbg = Image.fromarray(overlay)
             return crop_pil, dbg, used_fallback
 
         return crop_pil
+
 
 

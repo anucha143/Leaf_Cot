@@ -359,12 +359,10 @@ def predict_all_models(feat_vec: np.ndarray, models: dict):
 # =========================================================
 
 @st.cache_resource
-def load_leaf_gate():
-    """
-    LeafGateCLIPSeg ภายในจะจัดการ device เอง
-    """
+def load_leaf_gate(version: str = "v3_soft_mask"):
     gate = LeafGateCLIPSeg()
     return gate
+
 
 
 # =========================================================
@@ -385,7 +383,7 @@ def main():
     # ================================
     # 2) โหลดโมเดลหลักทั้งหมด
     # ================================
-    gate = load_leaf_gate()                         # Leaf Gate (CLIPSeg)
+    gate = load_leaf_gate("v3_soft_mask")                         # Leaf Gate (CLIPSeg)
     vit, vit_tfm, vit_device = load_vit_backbone()  # ViT feature extractor
     models = load_ml_models()                       # ConvNeXt + class names
 
