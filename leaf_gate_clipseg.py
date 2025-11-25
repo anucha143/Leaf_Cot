@@ -155,15 +155,14 @@ class LeafGateCLIPSeg:
 
             # ✅ ระบายสีเขียวทึบเฉพาะจุดที่เป็นใบไม้
             #    ถ้าอยากเห็น texture ใบไม้ใต้ mask ให้ใช้ blend ด้านล่างแทน
-            overlay[bin_mask == 100] = np.array([0, 255, 0], dtype=np.uint8)
+            # overlay[bin_mask == 255] = np.array([0, 255, 0], dtype=np.uint8)
 
-            # --- ตัวเลือก: ถ้าอยากให้เขียวโปร่งหน่อย ให้ใช้แบบ blend นี้แทน ---
-            # mask_idx = (bin_mask == 255)
-            # green = np.array([0, 255, 0], dtype=np.uint8)
-            # alpha = 0.4  # 0.0 = ไม่เขียว, 1.0 = เขียวทึบ
-            # overlay[mask_idx] = (
-            #     overlay[mask_idx] * (1 - alpha) + green * alpha
-            # ).astype(np.uint8)
+            mask_idx = (bin_mask == 255)
+            green = np.array([0, 255, 0], dtype=np.uint8)
+            alpha = 0.4  # 0.0 = ไม่เขียว, 1.0 = เขียวทึบ
+            overlay[mask_idx] = (
+                overlay[mask_idx] * (1 - alpha) + green * alpha
+            ).astype(np.uint8)
             # ---------------------------------------------------------------------
 
             dbg = Image.fromarray(overlay)
