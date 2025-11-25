@@ -250,7 +250,6 @@ def load_ml_models():
         "conv_pca": conv_pca,
     }
 
-
 # =========================================================
 # 4. Ensemble prediction
 # =========================================================
@@ -260,7 +259,6 @@ def softmax_np(logits):
     logits = logits - logits.max()
     exps = np.exp(logits)
     return exps / exps.sum()
-
 
 def predict_all_models(feat_vec: np.ndarray, models: dict):
     """
@@ -373,138 +371,97 @@ def load_leaf_gate():
 # 6. Streamlit UI
 # =========================================================
 def main():
+    # ปรับสีหัวข้อให้เป็นสีเขียวพาสเทล #CCFFCC
+    st.markdown(
+        """
+        <style>
+        h1 {
+            background-color: #CCFFCC;
+            padding: 0.75rem 1rem;
+            border-radius: 0.75rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.title("Leaf Classification Demo 🌿")
-    st.write("ViT → ML (SVM, RF, ConvNeXt1D) + PCA + Ensemble")
+    st.write(
+        "ระบบนี้จะใช้ **Leaf Gate (CLIPSeg)** ในการตัดเฉพาะบริเวณใบไม้ "
+        "จากนั้นใช้ **ViT (DINOv2)** สร้าง feature และใช้ **ConvNeXt1D** "
+        "เป็นตัวจำแนกใบไม้ 3 กลุ่ม: dicot / monocot / other"
+    )
 
-    # โหลดโมเดลหลักต่าง ๆ (มี cache แล้ว)
-    gate = load_leaf_gate()                         # CLIPSeg LeafGate
+    # โหลดโมเดลหลักทั้งหมด (cache เพื่อลดเวลาโหลดซ้ำ)
+    gate = load_leaf_gate()                      # Leaf Gate (CLIPSeg)
     vit, vit_tfm, vit_device = load_vit_backbone()  # ViT feature extractor
-    models = load_ml_models()                       # SVM, RF, ConvNeXt, PCA, ฯลฯ
+    models = load_ml_models()                    # รวม ConvNeXt และข้อมูลอื่น ๆ
 
-    # ===== 1) อัปโหลดรูปภาพ =====
+    # อัปโหลดรูปจากผู้ใช้
     uploaded_file = st.file_uploader(
         "อัปโหลดรูปใบไม้ (jpg, png)",
         type=["jpg", "jpeg", "png"],
-        key="uploader"
     )
 
     if uploaded_file is None:
-        st.info("กรุณาอัปโหลดรูปภาพก่อน")
-        # ถ้าเปลี่ยนไฟล์ใหม่ ให้ล้างผลเก่าออก (กันสับสน)
-        st.session_state.pop("feat", None)
-        st.session_state.pop("results", None)
+        st.info("กรุณาอัปโหลดรูปภาพใบไม้ เพื่อเริ่มการจำแนก")
         return
 
+    # อ่านรูปเป็น PIL.Image
     pil = Image.open(uploaded_file).convert("RGB")
-    st.image(pil, caption="ภาพต้นฉบับ", use_container_width=True)
 
-    # ===== 2) เลือกว่าจะใช้ Leaf Gate (CLIPSeg) หรือไม่ =====
-    use_gate = st.checkbox("ใช้ Leaf Gate (CLIPSeg) ตัดเฉพาะส่วนใบไม้", value=True)
-
-    leaf_img = pil       # รูปที่จะส่งเข้า ViT (เริ่มต้น = รูปเต็ม)
-    debug_imgs = None    # สำหรับเก็บรูป debug (overlay / mask ฯลฯ)
-
-    if use_gate:
-        with st.spinner("กำลังตรวจหาบริเวณใบไม้ด้วย CLIPSeg..."):
-            crop, dbg, fb = gate.crop_leaf_from_pil(pil, return_debug=True)
-
-        if crop is None:
-            st.warning("ไม่พบใบไม้ชัดเจนในภาพนี้ (mask มีน้อยกว่า threshold)")
+    # ----------------------------
+    # 1) Leaf Gate ทำงานอัตโนมัติ (ไม่มี checkbox แล้ว)
+    # ----------------------------
+    with st.spinner("กำลังตรวจหาบริเวณใบไม้ด้วย Leaf Gate..."):
+        try:
+            # คืนเฉพาะภาพใบไม้ที่ถูกครอปแล้ว (ขนาดใกล้เคียง 518x518)
+            leaf_img = gate.crop_leaf_from_pil(pil)
+        except Exception as e:
+            st.error(f"เกิดข้อผิดพลาดในขั้นตอน Leaf Gate: {e}")
             return
 
-        leaf_img = crop
-        debug_imgs = dbg
+    if leaf_img is None:
+        st.warning("ไม่พบใบไม้ชัดเจนในภาพนี้ กรุณาลองอัปโหลดรูปอื่น")
+        return
 
-        st.subheader("ผล Leaf Gate (CLIPSeg)")
-        c1, c2 = st.columns(2)
+    # แสดงเฉพาะรูปหลังผ่าน Leaf Gate ตามที่ต้องการ
+    st.subheader("ภาพใบไม้หลังผ่าน Leaf Gate")
+    st.image(leaf_img, caption="Leaf Gate Output", use_column_width=True)
 
-        with c1:
-            st.image(leaf_img, caption="Crop เฉพาะใบไม้", use_container_width=True)
+    # ----------------------------
+    # 2) ปุ่ม Predict ด้วย ConvNeXt เพียงอย่างเดียว
+    # ----------------------------
+    if st.button("🔍 Predict ด้วย ConvNeXt"):
+        # 2.1 ดึง feature จาก ViT ใช้ภาพที่ผ่าน Leaf Gate แล้วเท่านั้น
+        with st.spinner("กำลังดึงคุณลักษณะจาก ViT และทำนายผลด้วย ConvNeXt..."):
+            feat = extract_vit_feature_from_pil(
+                leaf_img, vit, vit_tfm, vit_device
+            )  # shape = (D,)
 
-        with c2:
-            # ป้องกัน error: dbg อาจเป็น dict หรือเป็นรูปเดี่ยว
-            if debug_imgs is not None:
-                if isinstance(debug_imgs, dict):
-                    if "overlay" in debug_imgs:
-                        st.image(
-                            debug_imgs["overlay"],
-                            caption="Overlay mask",
-                            use_container_width=True
-                        )
-                    elif "mask" in debug_imgs:
-                        st.image(
-                            debug_imgs["mask"],
-                            caption="Mask",
-                            use_container_width=True
-                        )
-                elif isinstance(debug_imgs, Image.Image):
-                    st.image(
-                        debug_imgs,
-                        caption="Overlay / Mask",
-                        use_container_width=True
-                    )
+            device = models["device"]
+            conv_model = models["conv_no_pca"]      # ใช้ ConvNeXt (non-PCA) ตัวที่แม่นยำสุด
+            class_names = models["class_names"]
 
-    st.subheader("ขั้นตอนถัดไป: สร้าง Feature ด้วย ViT และทำนายด้วย ML")
+            x = feat.reshape(1, -1).astype(np.float32)  # (1, D)
 
-    # ===== 3) เลือกโมเดลหลักที่จะโชว์ผล (เลือกได้ตั้งแต่ก่อน predict) =====
-    model_choice = st.selectbox(
-        "เลือกโมเดลสำหรับผลหลัก",
-        [
-            "SVM",
-            "Random Forest",
-            "ConvNeXt",
-            "Ensemble (non-PCA)",
-            "SVM + PCA",
-            "Random Forest + PCA",
-            "ConvNeXt + PCA",
-            "Ensemble with PCA",
-        ],
-        key="model_choice"
-    )
+            with torch.no_grad():
+                x_t = torch.from_numpy(x).to(device)
+                logits = conv_model(x_t)               # [1, num_classes]
+                probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
-    choice_to_key = {
-        "SVM": ("non_pca", "svm"),
-        "Random Forest": ("non_pca", "rf"),
-        "ConvNeXt": ("non_pca", "convnext"),
-        "Ensemble (non-PCA)": ("non_pca", "ensemble"),
-        "SVM + PCA": ("pca", "svm_pca"),
-        "Random Forest + PCA": ("pca", "rf_pca"),
-        "ConvNeXt + PCA": ("pca", "convnext_pca"),
-        "Ensemble with PCA": ("pca", "ensemble_pca"),
-    }
+        # 2.2 แสดงผลลัพธ์จาก ConvNeXt
+        pred_idx = int(probs.argmax())
+        pred_label = class_names[pred_idx]
 
-    # ===== 4) ปุ่ม Predict -> คำนวณและเก็บลง session_state =====
-    if st.button("🔍 Predict ด้วย ML Models"):
-        with st.spinner("กำลังดึง Feature จาก ViT..."):
-            feat = extract_vit_feature_from_pil(leaf_img, vit, vit_tfm, vit_device)
+        st.subheader("ผลการจำแนกจาก ConvNeXt")
+        st.markdown(f"**Predicted class:** `{pred_label}`")
 
-        with st.spinner("กำลังทำนายด้วย SVM / RF / ConvNeXt / PCA / Ensemble..."):
-            results = predict_all_models(feat, models)
-
-        st.session_state["feat"] = feat
-        st.session_state["results"] = results
-
-    # ===== 5) ถ้ามีผลลัพธ์แล้ว (ใน session_state) ให้แสดงตาม model_choice =====
-    if "results" in st.session_state:
-        feat = st.session_state["feat"]
-        results = st.session_state["results"]
-
-        st.success(f"ได้ feature vector ขนาด {feat.shape[0]} มิติ จาก ViT")
-
-        group_key, inner_key = choice_to_key[model_choice]
-        main_res = results[group_key][inner_key]
-
-        probs_main = main_res["proba"]
-        label_main = main_res["pred_label"]
-
-        st.markdown(f"### ✅ ผลจากโมเดล: **{model_choice}**")
-        st.write(f"**Predicted class**: `{label_main}`")
-        st.write("**Probabilities:**")
-        for cls_name, p in zip(models["class_names"], probs_main):
-            st.write(f"- {cls_name}: {p:.3f}")
-    else:
-        st.info("กดปุ่ม **Predict ด้วย ML Models** ก่อน เพื่อดูผลการทำนาย")
+        st.write("**ความน่าจะเป็นของแต่ละคลาส:**")
+        for name, p in zip(class_names, probs):
+            st.write(f"- {name}: {p:.3f}")
 
 
 if __name__ == "__main__":
     main()
+
