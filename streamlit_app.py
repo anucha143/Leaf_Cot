@@ -250,7 +250,6 @@ def load_ml_models():
         "conv_pca": conv_pca,
     }
 
-
 # =========================================================
 # 4. Ensemble prediction
 # =========================================================
@@ -260,7 +259,6 @@ def softmax_np(logits):
     logits = logits - logits.max()
     exps = np.exp(logits)
     return exps / exps.sum()
-
 
 def predict_all_models(feat_vec: np.ndarray, models: dict):
     """
