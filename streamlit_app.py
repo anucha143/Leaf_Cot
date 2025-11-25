@@ -372,25 +372,8 @@ def load_leaf_gate():
 # =========================================================
 def main():
     # ปรับสีหัวข้อให้เป็นสีเขียวพาสเทล #CCFFCC
-    st.markdown(
-        """
-        <style>
-        h1 {
-            background-color: #CCFFCC;
-            padding: 0.75rem 1rem;
-            border-radius: 0.75rem;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
 
-    st.title("Leaf Classification Demo 🌿")
-    st.write(
-        "ระบบนี้จะใช้ **Leaf Gate (CLIPSeg)** ในการตัดเฉพาะบริเวณใบไม้ "
-        "จากนั้นใช้ **ViT (DINOv2)** สร้าง feature และใช้ **ConvNeXt1D** "
-        "เป็นตัวจำแนกใบไม้ 3 กลุ่ม: dicot / monocot / other"
-    )
+    st.title("Leaf Classification Web Service 🌿")
 
     # โหลดโมเดลหลักทั้งหมด (cache เพื่อลดเวลาโหลดซ้ำ)
     gate = load_leaf_gate()                      # Leaf Gate (CLIPSeg)
