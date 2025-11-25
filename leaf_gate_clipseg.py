@@ -135,18 +135,20 @@ class LeafGateCLIPSeg:
             used_fallback = True
         else:
             x, y, bw, bh = bbox
-            crop_rgb = np_img[y:y+bh, x:x+bw]
+            crop_rgb = np_img[y:y + bh, x:x + bw]
             used_fallback = False
 
+        # ภาพที่เอาไปเข้า ViT (resize แล้ว) – ใช้ภายในโมเดลเท่านั้น
         crop_pil = Image.fromarray(crop_rgb).resize((out_size, out_size), Image.BICUBIC)
 
         if return_debug:
-            overlay = np_img.copy()
+            # ✅ ภาพ debug: พื้นดำทั้งภาพ แล้วระบายสีเขียวเฉพาะตำแหน่งใบไม้
+            overlay = np.zeros_like(np_img)  # [H, W, 3] = ดำสนิท
             if bin_mask.sum() > 0:
-                overlay[bin_mask == 255] = (
-                    overlay[bin_mask == 255] * 0.6 + np.array([0, 255, 0]) * 0.4
-                ).astype(np.uint8)
+                overlay[bin_mask == 255] = np.array([0, 255, 0], dtype=np.uint8)
+
             dbg = Image.fromarray(overlay)
             return crop_pil, dbg, used_fallback
 
         return crop_pil
+

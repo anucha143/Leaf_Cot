@@ -372,23 +372,16 @@ def load_leaf_gate():
 # =========================================================
 def main():
     # ================================
-    # 1) หัวข้อสีเขียวพาสเทล (ไม่มี padding / box)
+    # 1) หัวข้อสีเขียวพาสเทล (ไม่มีกรอบ / ไม่มี padding เพิ่ม)
     # ================================
     st.markdown(
         """
-        <h1 style="color:#CCFFCC; font-weight:700; margin:0 0 0.5rem 0;">
-            Leaf Classification Demo 🌿
+        <h1 style="color:#397D54; font-weight:700; margin:0 0 0.75rem 0;">
+            Leaf Classification Web Service 🌿
         </h1>
         """,
         unsafe_allow_html=True,
     )
-
-    st.write(
-        "ระบบนี้จะใช้ **Leaf Gate (CLIPSeg)** ในการตัดเฉพาะบริเวณใบไม้ "
-        "จากนั้นใช้ **ViT (DINOv2)** สร้าง feature และใช้ **ConvNeXt1D** "
-        "เป็นตัวจำแนกใบไม้ 3 กลุ่ม: dicot / monocot / other"
-    )
-
     # ================================
     # 2) โหลดโมเดลหลักทั้งหมด
     # ================================
@@ -411,17 +404,28 @@ def main():
     # อ่านรูปเป็น PIL.Image (ภาพต้นฉบับ)
     pil = Image.open(uploaded_file).convert("RGB")
 
-    # แสดง "ภาพต้นฉบับ" ให้ผู้ใช้เห็นเสมอ (เพื่อความเป็นมิตรต่อผู้ใช้)
-    st.subheader("ภาพที่อัปโหลด")
-    st.image(pil, caption="ภาพต้นฉบับที่อัปโหลด", use_column_width=True)
+    # ทำ layout 2 คอลัมน์: ซ้าย = รูปต้นฉบับ, ขวา = ผลจาก Leaf Gate
+    col1, col2 = st.columns(2)
 
-    # ================================
-    # 4) Leaf Gate ทำงานอัตโนมัติ
-    #    และอนุญาตให้ทำงานเฉพาะเมื่อเจอใบไม้จริง ๆ เท่านั้น
-    # ================================
-    with st.spinner("กำลังตรวจหาบริเวณใบไม้ด้วย Leaf Gate..."):
+    # --------------------------------
+    # คอลัมน์ซ้าย: ภาพต้นฉบับ (กดดูรูปได้)
+    # --------------------------------
+    with col1:
+        st.subheader("ภาพต้นฉบับ")
+        st.image(
+            pil,
+            caption="ภาพต้นฉบับที่อัปโหลด",
+            use_container_width=True,
+        )
+
+    # --------------------------------
+    # 4) ให้ Leaf Gate ทำงาน และสร้างภาพ debug
+    # --------------------------------
+    with st.spinner("กำลังตรวจหาบริเวณใบไม้ ..."):
         try:
-            # ใช้ return_debug=True เพื่อให้ได้ flag used_fallback
+            # leaf_img = ภาพที่ถูก crop + resize 518x518 (ใช้กับโมเดลอย่างเดียว)
+            # dbg_img   = ภาพดำที่ระบายสีเขียวเฉพาะตำแหน่งใบไม้
+            # used_fallback = True ถ้า Leaf Gate หาใบไม้ไม่เจอ
             leaf_img, dbg_img, used_fallback = gate.crop_leaf_from_pil(
                 pil,
                 out_size=IMG_SIZE_VIT,
@@ -431,24 +435,39 @@ def main():
             st.error(f"เกิดข้อผิดพลาดในขั้นตอน Leaf Gate: {e}")
             return
 
-    # ถ้า used_fallback = True แปลว่า CLIPSeg หาใบไม้ไม่เจอ (ไม่มี mask สีเขียว)
-    # กรณีนี้เราจะ "ไม่จำแนก" และให้ผู้ใช้ลองรูปใหม่
-    if used_fallback:
-        st.warning(
-            "Leaf Gate ไม่พบพื้นที่ใบไม้หรือสีเขียวเพียงพอในภาพนี้ \n\n"
-            "กรุณาลองอัปโหลดรูปที่มีใบไม้ชัดเจน หรือมีการระบายสีเขียวเฉพาะบริเวณใบอีกครั้ง 🙂"
-        )
-        return
+    # --------------------------------
+    # คอลัมน์ขวา: ภาพ Leaf Gate (มีแค่สีเขียว)
+    # --------------------------------
+    with col2:
+        st.subheader("ใบไม้ที่ตรวจพบ")
+        if used_fallback:
+            st.warning(
+                "ไม่พบพื้นที่ใบไม้หรือสีเขียวเพียงพอในภาพนี้ "
+            )
+            # แสดงภาพต้นฉบับซ้ำให้ผู้ใช้เห็นว่าไม่มีส่วนไหนถูกจับเป็นใบไม้
+            st.image(
+                pil,
+                caption="ไม่พบพื้นที่สีเขียวในภาพ",
+                use_container_width=True,
+            )
+        else:
+            st.image(
+                dbg_img,
+                caption="ตำแหน่งใบไม้",
+                use_container_width=True,
+            )
 
-    # หมายเหตุ: เราใช้ leaf_img (ภาพที่ครอปเป็น 518×518) เฉพาะสำหรับโมเดลเท่านั้น
-    #           แต่ *ไม่แสดง* รูปนี้บนหน้าจอ ตามความต้องการของคุณ
+    # ถ้า Leaf Gate หาใบไม่เจอ -> ไม่ให้กด Predict ต่อ
+    if used_fallback:
+        st.info("ไม่สามารถจำแนกได้ เนื่องจากไม่พบใบไม้ในภาพนี้")
+        return
 
     # ================================
     # 5) ปุ่ม Predict ด้วย ConvNeXt เพียงอย่างเดียว
     # ================================
     if st.button("🔍 Predict ด้วย ConvNeXt"):
         with st.spinner("กำลังดึงคุณลักษณะจาก ViT และทำนายผลด้วย ConvNeXt..."):
-            # ดึง feature จาก ViT โดยใช้ภาพ leaf_img ที่ผ่าน Leaf Gate แล้ว
+            # ใช้ภาพ leaf_img (ที่ถูก crop + resize แล้ว) เพื่อดึง feature
             feat = extract_vit_feature_from_pil(
                 leaf_img, vit, vit_tfm, vit_device
             )  # shape = (D,)
@@ -480,4 +499,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
