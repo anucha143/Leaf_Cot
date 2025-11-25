@@ -1,144 +1,221 @@
 import os
+from typing import Tuple, List
+
 import numpy as np
-import streamlit as st
 from PIL import Image
 
+import streamlit as st
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 import timm
 from torchvision import transforms as T
-import joblib
 
 from leaf_gate_clipseg import LeafGateCLIPSeg
 
-# =========================================================
-# 1. ConvNeXt-style 1D head  (ใช้เหมือนตอนเทรน)
-# =========================================================
+# -------------------------------------------------
+# 0. Streamlit basic config + simple pastel title color
+# -------------------------------------------------
+
+st.set_page_config(
+    page_title="Leaf Classification (ViT + ConvNeXt + LeafGate)",
+    page_icon="🌿",
+    layout="centered",
+)
+
+# เปลี่ยน "สีตัวอักษร" ของหัวข้อให้เป็นเขียวพาสเทล #CCFFCC
+# โดยไม่ไปยุ่งกับ padding / background ของ layout เดิม
+st.markdown(
+    """
+    <style>
+    h1, h2, h3 {
+        color: #CCFFCC;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -------------------------------------------------
+# 1. ConvNeXt 1D block + head (ต้องเหมือนตอนเทรนใน train_ml_with_ensemble.py)
+# -------------------------------------------------
+
 
 class ConvNeXt1DBlock(nn.Module):
-    def __init__(self, dim: int, kernel_size: int = 7, layer_scale_init_value: float = 1e-6):
+    """
+    1D ConvNeXt block:
+    - depthwise conv (Conv1d with groups=C)
+    - LayerNorm
+    - pointwise MLP 2 ชั้น (Linear up -> GELU -> Linear down)
+    - gamma (learnable scale) + residual
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        kernel_size: int = 7,
+        mlp_ratio: int = 4,
+        scale_init_value: float = 1e-6,
+    ) -> None:
         super().__init__()
-        # depthwise conv 1D
+        up_dim = in_channels * mlp_ratio
+
+        # depthwise conv: ทำงานบนแกนเวลา/ลำดับ (L) โดยไม่เปลี่ยนจำนวน channel
         self.dwconv = nn.Conv1d(
-            dim,
-            dim,
+            in_channels=in_channels,
+            out_channels=in_channels,
             kernel_size=kernel_size,
             padding=kernel_size // 2,
-            groups=dim,
+            groups=in_channels,
         )
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
-        self.pw1 = nn.Linear(dim, 4 * dim)
+
+        # layer norm บน dim channel
+        self.norm = nn.LayerNorm(in_channels, eps=1e-6)
+
+        # pointwise MLP: C -> 4C -> C (เหมือน ConvNeXt ปกติ)
+        self.pw1 = nn.Linear(in_channels, up_dim)
         self.act = nn.GELU()
-        self.pw2 = nn.Linear(4 * dim, dim)
-        self.gamma = (
-            nn.Parameter(layer_scale_init_value * torch.ones(dim))
-            if layer_scale_init_value > 0
-            else None
-        )
+        self.pw2 = nn.Linear(up_dim, in_channels)
+
+        # gamma เป็น learnable scale สำหรับ output ของ block
+        self.gamma = nn.Parameter(scale_init_value * torch.ones(in_channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: [B, L, D]  (เราใช้ L=1)
+        x: [B, C, L]
         """
-        shortcut = x  # [B, L, D]
+        shortcut = x
 
-        # [B, L, D] -> [B, D, L] เพื่อใช้ conv1d
-        x = x.transpose(1, 2)
-        x = self.dwconv(x)
-        x = x.transpose(1, 2)  # กลับเป็น [B, L, D]
-
+        # Conv1d ทำงานกับ [B, C, L]
+        # แต่ LayerNorm / Linear ของเราตั้งค่าให้ normalize ที่ dim สุดท้าย
+        # จึงต้อง transpose ไป-กลับ
+        x = x
+        x = self.dwconv(x)         # [B, C, L]
+        x = x.transpose(1, 2)      # [B, L, C]
         x = self.norm(x)
         x = self.pw1(x)
         x = self.act(x)
         x = self.pw2(x)
-
-        if self.gamma is not None:
-            x = self.gamma * x
+        x = x * self.gamma
+        x = x.transpose(1, 2)      # [B, C, L]
 
         x = x + shortcut
         return x
 
 
 class ConvNeXt1DHead(nn.Module):
+    """
+    หัว ConvNeXt 1D แบบง่ายสำหรับเอา ViT feature vector มา classify 3 class
+    ใช้ได้ทั้งกรณี input เป็น feature ตรง ๆ หรือ feature ที่ลดมิติด้วย PCA แล้ว
+    """
+
     def __init__(
         self,
-        in_dim: int,
-        hidden_dim: int,
-        num_classes: int,
+        in_dim: int = 384,     # ขนาด feature จาก ViT
+        num_classes: int = 3,  # dicot / monocot / other
         num_blocks: int = 2,
-    ):
-        """
-        in_dim      = dim ของ feature จาก ViT (เช่น 384) หรือจาก PCA
-        hidden_dim  = dim ภายใน ConvNeXt block
-        num_classes = จำนวนคลาส (เช่น 3)
-        """
+        mlp_ratio: int = 4,
+    ) -> None:
         super().__init__()
-        # โปรเจกต์จาก feature_dim -> hidden_dim
-        self.proj = nn.Linear(in_dim, hidden_dim)
 
-        # สร้างหลาย ๆ ConvNeXt block
-        self.blocks = nn.Sequential(
-            *[ConvNeXt1DBlock(hidden_dim) for _ in range(num_blocks)]
-        )
+        # แปลง [B, D] -> [B, D, 1] แล้วรันผ่าน ConvNeXt block หลายชั้น
+        blocks = []
+        for _ in range(num_blocks):
+            blocks.append(
+                ConvNeXt1DBlock(
+                    in_channels=in_dim,
+                    kernel_size=7,
+                    mlp_ratio=mlp_ratio,
+                    scale_init_value=1e-6,
+                )
+            )
+        self.blocks = nn.Sequential(*blocks)
 
-        # norm ด้านท้าย
-        self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
+        # normalize feature ก่อนเข้า fc
+        self.norm = nn.LayerNorm(in_dim, eps=1e-6)
 
         # classifier สุดท้าย
-        self.fc = nn.Linear(hidden_dim, num_classes)
+        self.fc = nn.Linear(in_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: [B, F]  (F = feature_dim จาก ViT หรือ PCA)
-        return: [B, num_classes]
+        x: [B, D]
         """
-        # 1) โปรเจกต์ก่อน
-        x = self.proj(x)          # [B, H]
+        # เพิ่มแกน L=1 เพื่อใช้กับ Conv1d
+        x = x.unsqueeze(-1)           # [B, D, 1]
+        x = self.blocks(x)            # [B, D, 1]
 
-        # 2) ใส่มิติ L=1 เพื่อผ่าน ConvNeXt1DBlock
-        x = x.unsqueeze(1)        # [B, 1, H]
-        x = self.blocks(x)        # [B, 1, H]
+        # global pooling ตามแกน L (ซึ่งมีขนาด 1 อยู่แล้ว)
+        x = x.mean(dim=-1)            # [B, D]
 
-        # 3) ดึงออกมาเหลือ [B, H]
-        x = x[:, 0, :]            # [B, H]
-
-        # 4) norm + fc
-        x = self.norm(x)          # [B, H]
-        x = self.fc(x)            # [B, num_classes]
+        x = self.norm(x)
+        x = self.fc(x)                # [B, num_classes]
         return x
 
 
-# =========================================================
+# -------------------------------------------------
 # 2. ViT feature extractor
-# =========================================================
+# -------------------------------------------------
 
 IMG_SIZE_VIT = 518
 VIT_MODEL_NAME = "vit_small_patch14_dinov2"
-MODEL_DIR = "models"  # ที่เก็บ .pkl / .pth / .npy
+MODEL_DIR = "models"
 
 
 def get_eval_transform(img_size: int = IMG_SIZE_VIT):
-    return T.Compose([
-        T.Resize(int(img_size * 1.15)),
-        T.CenterCrop(img_size),
-        T.ToTensor(),
-        T.Normalize(mean=(0.5, 0.5, 0.5),
-                    std=(0.5, 0.5, 0.5)),
-    ])
+    """
+    Transform สำหรับเตรียมรูปภาพก่อนเข้า ViT:
+    - Resize (ขยายเผื่อ) แล้ว CenterCrop
+    - แปลงเป็น Tensor
+    - Normalize ให้อยู่ในสเกลใกล้เคียงตอน pretrain
+    """
+    return T.Compose(
+        [
+            T.Resize(int(img_size * 1.15)),
+            T.CenterCrop(img_size),
+            T.ToTensor(),
+            T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        ]
+    )
 
 
 @st.cache_resource
-def load_vit_backbone(
-    model_name: str = VIT_MODEL_NAME,
-    img_size: int = IMG_SIZE_VIT,
-):
+def load_vit_and_convnext() -> Tuple[nn.Module, nn.Module, T.Compose, List[str], torch.device]:
+    """
+    โหลด ViT backbone + ConvNeXt1D head + class_names
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    vit = timm.create_model(model_name, pretrained=True, num_classes=0)  # num_classes=0 -> return features
-    vit.eval().to(device)
-    tfm = get_eval_transform(img_size)
-    return vit, tfm, device
+
+    # ViT feature extractor (ไม่ใช้ classifier head)
+    vit = timm.create_model(VIT_MODEL_NAME, pretrained=True, num_classes=0)
+    vit.eval()
+    vit.to(device)
+
+    tfm = get_eval_transform(IMG_SIZE_VIT)
+
+    # class names
+    class_path = os.path.join(MODEL_DIR, "class_names.npy")
+    raw = np.load(class_path, allow_pickle=True)
+    if isinstance(raw, np.ndarray):
+        class_names = [str(x) for x in raw.tolist()]
+    else:
+        class_names = [str(x) for x in raw]
+
+    num_classes = len(class_names)
+
+    # ConvNeXt head (no PCA) – in_dim ต้องตรงกับ dim ของ ViT feature (384)
+    conv = ConvNeXt1DHead(
+        in_dim=384,
+        num_classes=num_classes,
+        num_blocks=2,
+        mlp_ratio=4,
+    )
+    ckpt_path = os.path.join(MODEL_DIR, "convnext1d_no_pca.pth")
+    state = torch.load(ckpt_path, map_location=device)
+    conv.load_state_dict(state)
+    conv.to(device)
+    conv.eval()
+
+    return vit, conv, tfm, class_names, device
 
 
 @torch.no_grad()
@@ -189,157 +266,110 @@ def extract_vit_feature_from_pil(
     return feat_np
 
 
-# =========================================================
-# 3. โหลด ML models + PCA + ConvNeXt1D
-# =========================================================
-
-@st.cache_resource
-def load_ml_models():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # ----- class names -----
-    raw = np.load(os.path.join(MODEL_DIR, "class_names.npy"), allow_pickle=True)
-    if isinstance(raw, np.ndarray):
-        class_names = [str(x) for x in raw.tolist()]
-    else:
-        class_names = [str(raw)]
-
-    num_classes = len(class_names)
-
-    # ----- โหลดเฉพาะ ConvNeXt ที่เราจะใช้จริง -----
-    feat_dim = 384  # ต้องตรงกับ feature dim จาก ViT
-    conv_no_pca = ConvNeXt1DHead(
-        in_dim=feat_dim,
-        hidden_dim=384,
-        num_classes=num_classes,
-        num_blocks=2,
-    )
-    state_no_pca = torch.load(os.path.join(MODEL_DIR, "convnext1d_no_pca.pth"), map_location=device)
-    conv_no_pca.load_state_dict(state_no_pca)
-    conv_no_pca.to(device).eval()
-
-    return {
-        "device": device,
-        "class_names": class_names,
-        "conv_no_pca": conv_no_pca,
-    }
-
-
-# =========================================================
-# 4. Leaf Gate (CLIPSeg)
-# =========================================================
-
-@st.cache_resource
-def load_leaf_gate():
+def predict_convnext(
+    feat_vec: np.ndarray,
+    conv: nn.Module,
+    class_names: List[str],
+    device: torch.device,
+):
     """
-    LeafGateCLIPSeg ภายในจะจัดการ device เอง
+    รับ feature vector 1 รูป -> คืน (pred_label, prob_per_class)
+    """
+    x = torch.from_numpy(feat_vec.reshape(1, -1)).to(device)
+    with torch.no_grad():
+        logits = conv(x)               # [1, C]
+        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+
+    pred_idx = int(np.argmax(probs))
+    pred_label = class_names[pred_idx]
+    return pred_label, probs
+
+
+# -------------------------------------------------
+# 3. LeafGate (CLIPSeg) – ตัดใบไม้ออกมา + overlay สีเขียว
+# -------------------------------------------------
+
+
+@st.cache_resource
+def load_leaf_gate() -> LeafGateCLIPSeg:
+    """
+    โหลด LeafGateCLIPSeg เพียงครั้งเดียว แล้ว cache ไว้ใช้ซ้ำ
     """
     gate = LeafGateCLIPSeg()
     return gate
 
 
-# =========================================================
-# 5. Streamlit UI
-# =========================================================
+# -------------------------------------------------
+# 4. Streamlit UI
+# -------------------------------------------------
+
+
 def main():
-    # ปรับ "สีตัวอักษร" ของหัวข้อให้เป็นสีเขียวพาสเทล (ไม่ใช้กล่อง / ไม่ใช้ padding)
-    st.markdown(
-        """
-        <style>
-        h1 {
-            color: #66CC99;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.title("LeafGate Leaf Classification 🌿")
 
-    st.title("Leaf Classification Demo 🌿")
     st.write(
-        "ระบบนี้จะใช้ **Leaf Gate (CLIPSeg)** ในการตัดเฉพาะบริเวณใบไม้ "
-        "จากนั้นใช้ **ViT (DINOv2)** สร้าง feature และใช้ **ConvNeXt1D** "
-        "เป็นตัวจำแนกใบไม้ 3 กลุ่ม: dicot / monocot / other"
+        "ระบบจำแนกชนิดใบไม้ด้วย ViT + ConvNeXt "
+        "พร้อม Leaf Gate (CLIPSeg) ที่ช่วยระบายสีเขียวเฉพาะบริเวณใบไม้ให้ดูชัดเจน"
     )
 
-    # โหลดโมเดลหลักทั้งหมด (cache เพื่อลดเวลาโหลดซ้ำ)
-    gate = load_leaf_gate()                         # Leaf Gate (CLIPSeg)
-    vit, vit_tfm, vit_device = load_vit_backbone()  # ViT feature extractor
-    models = load_ml_models()                       # ConvNeXt และ class names
+    # โหลดโมเดล / ฟังก์ชันต่าง ๆ
+    gate = load_leaf_gate()
+    vit, conv, vit_tfm, class_names, device = load_vit_and_convnext()
 
-    # อัปโหลดรูปจากผู้ใช้
     uploaded_file = st.file_uploader(
         "อัปโหลดรูปใบไม้ (jpg, png)",
         type=["jpg", "jpeg", "png"],
     )
 
     if uploaded_file is None:
-        st.info("กรุณาอัปโหลดรูปภาพใบไม้ เพื่อเริ่มการจำแนก")
+        st.info("กรุณาอัปโหลดรูปใบไม้ก่อนนะครับ")
         return
 
-    # อ่านรูปเป็น PIL.Image
+    # อ่านรูปต้นฉบับ
     pil = Image.open(uploaded_file).convert("RGB")
 
-    # ----------------------------
-    # 1) Leaf Gate ทำงานอัตโนมัติ
-    #    และ "ทำงานเฉพาะกรณีที่มี mask สีเขียวจริง ๆ"
-    # ----------------------------
-    with st.spinner("กำลังตรวจหาบริเวณใบไม้ด้วย Leaf Gate..."):
-        try:
-            # ใช้ return_debug=True เพื่อเช็คว่า Leaf Gate ต้อง fallback หรือไม่
-            leaf_img, dbg_img, used_fallback = gate.crop_leaf_from_pil(
-                pil,
-                out_size=IMG_SIZE_VIT,
-                return_debug=True,
-            )
-        except Exception as e:
-            st.error(f"เกิดข้อผิดพลาดในขั้นตอน Leaf Gate: {e}")
-            return
-
-    # ถ้า used_fallback = True หมายถึง Leaf Gate หา mask ไม่เจอ
-    # (ไม่มีพื้นที่สีเขียวเพียงพอ) -> ไม่ทำงานต่อ / ไม่จำแนก
-    if used_fallback:
-        st.warning(
-            "Leaf Gate ไม่พบพื้นที่ใบไม้ที่ชัดเจนในภาพนี้ "
-            "หรือไม่มีบริเวณที่เป็นสีเขียวเพียงพอในการสร้าง mask\n\n"
-            "กรุณาลองอัปโหลดรูปที่มีใบไม้ชัดเจน หรือมีการระบายสีเขียวเฉพาะบริเวณใบอีกครั้ง 🙂"
+    # ใช้ Leaf Gate แบบอัตโนมัติทันทีที่มีรูป
+    st.subheader("ผลจาก Leaf Gate (ระบายสีเขียวเฉพาะใบไม้)")
+    with st.spinner("กำลังใช้ Leaf Gate ตรวจหาบริเวณใบไม้..."):
+        crop_img, overlay_img, used_fallback = gate.crop_leaf_from_pil(
+            pil,
+            return_debug=True,
         )
-        return
 
-    # ตาม requirement ใหม่: ไม่ต้องแสดงภาพ 518×518 ที่ถูก Crop แล้ว
-    # ดังนั้นเราจะข้าม st.image(leaf_img) ไปเลย
-    # ถ้าในอนาคตอยาก debug สามารถนำ st.image(..) กลับมาได้ง่าย ๆ
+    if crop_img is None:
+        # ถ้า LeafGate ล้มเหลว ให้ใช้ภาพเต็มแทน และแจ้งเตือน
+        st.warning("Leaf Gate ไม่สามารถหาใบไม้ได้อย่างชัดเจน – จะใช้ทั้งภาพในการจำแนกแทน")
+        leaf_for_vit = pil
+        st.image(pil, caption="ใช้ภาพเต็มในการจำแนก", use_column_width=True)
+    else:
+        # แสดงเฉพาะ overlay ที่ระบายสีเขียวตามที่ร้องขอ
+        # (ไม่แสดงภาพ 518x518 crop)
+        st.image(
+            overlay_img,
+            caption="Leaf Gate: ใบไม้ถูกระบายสีเขียว (ใช้ส่วนนี้เป็นบริเวณใบไม้)",
+            use_column_width=True,
+        )
+        if used_fallback:
+            st.info("Leaf Gate ใช้โหมด fallback (ใบไม้มีขนาดเล็ก หรือแยกขอบเขตยาก)")
+        # สำหรับจำแนก ใช้ crop_img (ขนาด 518×518 ที่พร้อมเข้า ViT)
+        leaf_for_vit = crop_img
 
-    # ----------------------------
-    # 2) ปุ่ม Predict ด้วย ConvNeXt เพียงอย่างเดียว
-    # ----------------------------
-    if st.button("🔍 Predict ด้วย ConvNeXt"):
-        # 2.1 ดึง feature จาก ViT ใช้ภาพที่ผ่าน Leaf Gate แล้วเท่านั้น
-        with st.spinner("กำลังดึงคุณลักษณะจาก ViT และทำนายผลด้วย ConvNeXt..."):
-            feat = extract_vit_feature_from_pil(
-                leaf_img, vit, vit_tfm, vit_device
-            )  # shape = (D,)
+    # ปุ่มทำนายด้วย ConvNeXt เพียงตัวเดียว
+    if st.button("🔍 ทำนายชนิดใบไม้ด้วย ConvNeXt"):
+        with st.spinner("กำลังดึงคุณลักษณะจาก ViT และทำนายด้วย ConvNeXt..."):
+            feat_vec = extract_vit_feature_from_pil(
+                leaf_for_vit, vit, vit_tfm, device
+            )
+            pred_label, probs = predict_convnext(
+                feat_vec, conv, class_names, device
+            )
 
-            device = models["device"]
-            conv_model = models["conv_no_pca"]      # ใช้ ConvNeXt (non-PCA)
-            class_names = models["class_names"]
+        st.subheader("ผลการทำนายด้วย ConvNeXt")
+        st.markdown(f"### ✅ คำตอบหลัก: **{pred_label}**")
 
-            x = feat.reshape(1, -1).astype(np.float32)  # (1, D)
-
-            with torch.no_grad():
-                x_t = torch.from_numpy(x).to(device)
-                logits = conv_model(x_t)               # [1, num_classes]
-                probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-
-        # 2.2 แสดงผลลัพธ์จาก ConvNeXt
-        pred_idx = int(probs.argmax())
-        pred_label = class_names[pred_idx]
-
-        st.subheader("ผลการจำแนกจาก ConvNeXt")
-        st.markdown(f"**Predicted class:** `{pred_label}`")
-
-        st.write("**ความน่าจะเป็นของแต่ละคลาส:**")
-        for name, p in zip(class_names, probs):
-            st.write(f"- {name}: {p:.3f}")
+        st.write("ความน่าจะเป็นของแต่ละคลาส:")
+        for cls_name, p in zip(class_names, probs):
+            st.write(f"- **{cls_name}**: {p:.3f}")
 
 
 if __name__ == "__main__":
