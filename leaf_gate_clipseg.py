@@ -144,7 +144,7 @@ class LeafGateCLIPSeg:
             overlay = np_img.copy()
 
             # 🔽 ปรับความจางของสีเขียวตรงนี้
-            alpha = 0.15  # ยิ่งตัวเลขน้อย สีเขียวจะยิ่งจาง (ลองปรับ 0.1–0.2 ได้)
+            alpha = 0.25  # ยิ่งตัวเลขน้อย สีเขียวจะยิ่งจาง (ลองปรับ 0.1–0.2 ได้)
             mask_idx = (bin_mask == 255)
             green = np.array([0, 255, 0], dtype=np.float32)
 
