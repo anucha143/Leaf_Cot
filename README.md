@@ -4,6 +4,12 @@ This project contains **two steps**:
 1) **Leaf Gate (zero‑shot)** using **SigLIP** to decide if an image is a leaf or not — **no training required**.
 2) **Tri‑class classifier** (monocot/dicot/other) using **Vision Transformer (ViT) with LoRA fine‑tuning**.
 
+## Live Demo
+
+Try the deployed Streamlit app here:
+
+[https://leaf-classification-web-service.streamlit.app/](https://leaf-classification-web-service.streamlit.app/)
+
 ## Environment setup
 ```bash
 python -m venv .venv
